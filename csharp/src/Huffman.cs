@@ -80,7 +80,7 @@ public static class Huffman
     }
 
     /// <summary>Tokens -> coded block (3 trees, token count, byte count, bitstream). Distance = slot bit_length(dist-1) + (slot-1) extra bits.</summary>
-    public static byte[] EncodeTokens(List<Tok> toks)
+    public static (int[] L, int[] M, int[] D) TokenCodeLengths(List<Tok> toks)
     {
         var lf = new long[257]; var mf = new long[256]; var df = new long[32];
         foreach (var t in toks)
@@ -88,7 +88,12 @@ public static class Huffman
             if (t.Len == 0) lf[t.Lit]++;
             else { lf[256]++; mf[t.Len - 3]++; df[BitLen(t.Dist - 1)]++; }
         }
-        int[] L = CodeLengths(lf), M = CodeLengths(mf), D = CodeLengths(df);
+        return (CodeLengths(lf), CodeLengths(mf), CodeLengths(df));
+    }
+
+    public static byte[] EncodeTokens(List<Tok> toks)
+    {
+        var (L, M, D) = TokenCodeLengths(toks);
         var Lc = Table(L); var Mc = Table(M); var Dc = Table(D);
         var bw = new BitWriter();
         foreach (var t in toks)

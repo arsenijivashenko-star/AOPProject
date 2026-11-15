@@ -5,13 +5,15 @@ namespace Sarc;
 public static class Program
 {
     private const string Usage = @"SARC smart secure archiver (C#)
-  SarcArchiver archive INPUT OUT_BASE [-p PASSWORD] [--max-volume N] [--block-size N] [--strategy greedy|lazy|dp]
+  SarcArchiver archive INPUT OUT_BASE [-p PASSWORD] [--max-volume N] [--block-size N] [--strategy greedy|lazy|dp|dp-iter]
                                       [--packer dp|greedy] [--recursive] [--no-classifier] [--model model.json]
   SarcArchiver extract ARCHIVE [ARCHIVE...] OUTDIR [-p PASSWORD]     (ARCHIVE: base name or .arc volume files, any order)
+  SarcArchiver list ARCHIVE [ARCHIVE...] [-p PASSWORD]                (file table: names, sizes, CRC32, type, strategy, volumes)
+  SarcArchiver verify ARCHIVE [ARCHIVE...] [-p PASSWORD]              (full integrity check, writes nothing)
   SarcArchiver info VOLUME.arc [...]                                  (public header only, nothing is decrypted)
   SarcArchiver attack integrity ARCHIVE.arc [-p PASSWORD]             (flips single bits; every change must be rejected)
   SarcArchiver selftest [PROJECT_ROOT]                                (acceptance tests; PROJECT_ROOT holds corpus/ reference/ ...)
-Password: -p, or env SARC_PASSWORD, or prompt.  Exit codes: 0 ok, 1 test/attack failure, 2 archive error, 3 I/O error.";
+Password: -p, or env SARC_PASSWORD, or prompt.  Exit codes: 0 ok, 1 test/attack failure, 2 archive error, 3 I/O error, 4 internal error.";
 
     public static int Main(string[] args)
     {
@@ -19,6 +21,8 @@ Password: -p, or env SARC_PASSWORD, or prompt.  Exit codes: 0 ok, 1 test/attack 
         catch (SarcException e) { Console.Error.WriteLine($"error {e.Code}: {e.Message}"); return 2; }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or OutOfMemoryException)
         { Console.Error.WriteLine($"error E_IO: {e.GetType().Name}: {e.Message}"); return 3; }
+        catch (Exception e)
+        { Console.Error.WriteLine($"error E_INTERNAL: {e.GetType().Name}: {e.Message}"); return 4; }
     }
 
     private sealed class Opts
@@ -77,8 +81,8 @@ Password: -p, or env SARC_PASSWORD, or prompt.  Exit codes: 0 ok, 1 test/attack 
                 cfg.Params.BlockSize = IntOpt(o, "--block-size", 16384);
                 cfg.Params.Strategy = o.Val.GetValueOrDefault("--strategy", "lazy") switch
                 {
-                    "greedy" => Strategy.Greedy, "lazy" => Strategy.Lazy, "dp" => Strategy.Dp,
-                    _ => throw new SarcException("E_INPUT", "strategy must be greedy|lazy|dp")
+                    "greedy" => Strategy.Greedy, "lazy" => Strategy.Lazy, "dp" => Strategy.Dp, "dp-iter" => Strategy.Dp2,
+                    _ => throw new SarcException("E_INPUT", "strategy must be greedy|lazy|dp|dp-iter")
                 };
                 if (cfg.Packer != "dp" && cfg.Packer != "greedy") throw new SarcException("E_INPUT", "packer must be dp|greedy");
                 string model = o.Val.GetValueOrDefault("--model", Path.Combine(AppContext.BaseDirectory, "model.json"));
@@ -95,6 +99,22 @@ Password: -p, or env SARC_PASSWORD, or prompt.  Exit codes: 0 ok, 1 test/attack 
                 var outDir = o.Pos[^1]; var arcs = o.Pos.Take(o.Pos.Count - 1).ToList();
                 var names = Archiver.Extract(arcs, outDir, Password(o));
                 Console.WriteLine($"extracted {names.Count} file(s) to {outDir}: all CRC32 verified");
+                return 0;
+            }
+            case "list":
+            {
+                if (o.Pos.Count < 1) throw new SarcException("E_INPUT", "usage: list ARCHIVE...");
+                var (files, tot) = Archiver.ListArchive(o.Pos, Password(o));
+                Console.WriteLine($"{files.Count} file(s), {tot} volume(s)");
+                foreach (var f in files)
+                    Console.WriteLine($"  {f.Name,-32} {f.Size,9} B  crc32={f.Crc:x8}  type={f.Type}  strat={Strategy.Name(f.Strat)}  vol=[{string.Join(", ", f.Volumes)}]");
+                return 0;
+            }
+            case "verify":
+            {
+                if (o.Pos.Count < 1) throw new SarcException("E_INPUT", "usage: verify ARCHIVE...");
+                int n = Archiver.Verify(o.Pos, Password(o));
+                Console.WriteLine($"OK: {n} file(s) verified (HMAC, structure, CRC32); nothing written");
                 return 0;
             }
             case "info":

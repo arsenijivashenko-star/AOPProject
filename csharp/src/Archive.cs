@@ -294,6 +294,41 @@ public static class Archiver
         return result;
     }
 
+    public sealed class ListedFile
+    {
+        public string Name = ""; public uint Size, Crc; public byte Type, Strat; public List<int> Volumes = new();
+    }
+
+    /// <summary>File table of a (multi-volume) archive without decoding block data: header -> HMAC -> payload structure checked.</summary>
+    public static (List<ListedFile> files, int volumes) ListArchive(IReadOnlyList<string> archive, string password)
+    {
+        var vols = FindVolumes(archive);
+        var cache = new Dictionary<string, (byte[] ke, byte[] km)>();
+        var seen = new HashSet<int>(); int tot = -1;
+        var table = new Dictionary<string, ListedFile>();
+        foreach (string path in vols)
+        {
+            var (h, pt) = Fmt.OpenVolume(File.ReadAllBytes(path), password, cache);
+            if (tot < 0) tot = h.Tot;
+            else if (h.Tot != tot) throw new SarcException("E_PAYLOAD", "volumes belong to different sets");
+            if (!seen.Add(h.Idx)) throw new SarcException("E_VOLUME_DUP", $"volume {h.Idx} supplied twice");
+            var (fl, bl) = Fmt.ParsePayload(pt);
+            foreach (var f in fl)
+                if (!table.ContainsKey(f.Name)) table[f.Name] = new ListedFile { Name = f.Name, Size = f.Size, Crc = f.Crc, Type = f.Type, Strat = f.Strat };
+            foreach (var b in bl)
+            {
+                var v = table[fl[b.Fi].Name].Volumes;
+                if (!v.Contains(h.Idx)) v.Add(h.Idx);
+            }
+        }
+        var missing = Enumerable.Range(0, tot).Where(i => !seen.Contains(i)).ToList();
+        if (missing.Count > 0) throw new SarcException("E_VOLUME_MISSING", "missing volume(s) " + string.Join(",", missing));
+        return (table.Values.OrderBy(f => f.Name, StringComparer.Ordinal).ToList(), tot);
+    }
+
+    /// <summary>Full integrity check (HMAC, structure, decompression, size, CRC32) with nothing written to disk.</summary>
+    public static int Verify(IReadOnlyList<string> archive, string password) => DecodeArchive(FindVolumes(archive), password).Count;
+
     /// <summary>Atomic extraction: nothing is written unless EVERY volume and EVERY file verified; files are staged in a temp
     /// directory and then moved into place.</summary>
     public static List<string> Extract(IReadOnlyList<string> archive, string outDir, string password)

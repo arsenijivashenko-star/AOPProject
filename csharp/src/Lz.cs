@@ -36,7 +36,7 @@ public static class Lz
 
         public List<(int len, int dist)> Candidates(int i)
         {
-            var res = new List<(int, int)>();
+            var res = new List<(int len, int dist)>();
             if (i + _minm > _n) return res;
             InsertUpTo(i);
             int maxl = Math.Min(MaxMatch, _n - i);
@@ -74,38 +74,57 @@ public static class Lz
     public static List<Tok> ParseLazy(byte[] data, int window, int depth, int minMatch, int margin)
     {
         var mf = new MatchFinder(data, window, depth, minMatch); var toks = new List<Tok>(); int i = 0, n = data.Length;
-        var cur = n > 0 ? mf.Candidates(0) : new List<(int, int)>();
+        var cur = n > 0 ? mf.Candidates(0) : new List<(int len, int dist)>();
         while (i < n)
         {
             if (cur.Count > 0)
             {
                 var (l, d) = cur[^1];
-                var nxt = i + 1 < n ? mf.Candidates(i + 1) : new List<(int, int)>();
+                var nxt = i + 1 < n ? mf.Candidates(i + 1) : new List<(int len, int dist)>();
                 if (nxt.Count > 0 && nxt[^1].len >= l + margin)
                 {
                     toks.Add(new Tok(0, 0, data[i])); i++; cur = nxt; continue;
                 }
                 toks.Add(new Tok(l, d, 0)); i += l;
-                cur = i < n ? mf.Candidates(i) : new List<(int, int)>();
+                cur = i < n ? mf.Candidates(i) : new List<(int len, int dist)>();
             }
             else
             {
                 toks.Add(new Tok(0, 0, data[i])); i++;
-                cur = i < n ? mf.Candidates(i) : new List<(int, int)>();
+                cur = i < n ? mf.Candidates(i) : new List<(int len, int dist)>();
             }
+        }
+        return toks;
+    }
+
+    /// <summary>Candidate lists of every position (forward pass: the finder inserts positions incrementally).</summary>
+    public static List<(int len, int dist)>[] CandidatesAll(byte[] data, int window, int depth, int minMatch)
+    {
+        var mf = new MatchFinder(data, window, depth, minMatch);
+        var cand = new List<(int len, int dist)>[data.Length];
+        for (int i = 0; i < data.Length; i++) cand[i] = mf.Candidates(i);
+        return cand;
+    }
+
+    private static List<Tok> Backtrack(byte[] data, int[] chLen, int[] chDist)
+    {
+        var toks = new List<Tok>();
+        for (int i = 0; i < data.Length;)
+        {
+            if (chLen[i] == 0) { toks.Add(new Tok(0, 0, data[i])); i++; }
+            else { toks.Add(new Tok(chLen[i], chDist[i], 0)); i += chLen[i]; }
         }
         return toks;
     }
 
     /// <summary>Optimal parse. C[i] = min( lit + C[i+1], min over (d,l) in M_i of cost(d,l) + C[i+l] ), computed from the end of the
     /// block backwards, with FIXED costs (9 bits literal, 17 + max(0,bitlen(d-1)-1) bits reference). O(sum |M_i|).</summary>
-    public static (List<Tok> toks, long cost) ParseDp(byte[] data, int window, int depth, int minMatch)
+    public static (List<Tok> toks, long cost) ParseDp(byte[] data, int window, int depth, int minMatch,
+        List<(int len, int dist)>[]? cand = null)
     {
         int n = data.Length;
         if (n == 0) return (new List<Tok>(), 0);
-        var mf = new MatchFinder(data, window, depth, minMatch);
-        var cand = new List<(int len, int dist)>[n];
-        for (int i = 0; i < n; i++) cand[i] = mf.Candidates(i);          // ascending: the finder inserts positions incrementally
+        cand ??= CandidatesAll(data, window, depth, minMatch);
         var C = new long[n + 1]; var chLen = new int[n]; var chDist = new int[n];
         int minm = Math.Max(MinMatch, minMatch);
         for (int i = n - 1; i >= 0; i--)
@@ -124,13 +143,38 @@ public static class Lz
             }
             C[i] = best; chLen[i] = bl; chDist[i] = bd;
         }
-        var toks = new List<Tok>();
-        for (int i = 0; i < n;)
+        return (Backtrack(data, chLen, chDist), C[0]);
+    }
+
+    /// <summary>Optimal parse with per-symbol costs taken from Huffman code lengths of a PREVIOUS pass (constant during this pass, so
+    /// the recursion is well defined). litBits[b]: literal b; lenBits[l-3]: length symbol; distBits[slot]: distance slot (the slot-1
+    /// extra bits are added here); escBits: marker 256 in the literal tree. The reference cost depends on the length too.</summary>
+    public static (List<Tok> toks, long cost) ParseDpCosts(byte[] data, int[] litBits, int[] lenBits, int[] distBits, int escBits,
+        int window, int depth, int minMatch, List<(int len, int dist)>[]? cand = null)
+    {
+        int n = data.Length;
+        if (n == 0) return (new List<Tok>(), 0);
+        cand ??= CandidatesAll(data, window, depth, minMatch);
+        var C = new long[n + 1]; var chLen = new int[n]; var chDist = new int[n];
+        int minm = Math.Max(MinMatch, minMatch);
+        for (int i = n - 1; i >= 0; i--)
         {
-            if (chLen[i] == 0) { toks.Add(new Tok(0, 0, data[i])); i++; }
-            else { toks.Add(new Tok(chLen[i], chDist[i], 0)); i += chLen[i]; }
+            long best = litBits[data[i]] + C[i + 1]; int bl = 0, bd = 0;
+            int prevl = minm - 1;
+            foreach (var (l, dist) in cand[i])
+            {
+                int ds = Huffman.BitLen(dist - 1);
+                long baseCost = escBits + distBits[ds] + Math.Max(0, ds - 1);
+                for (int len = prevl + 1; len <= l; len++)
+                {
+                    long v = baseCost + lenBits[len - 3] + C[i + len];
+                    if (v < best) { best = v; bl = len; bd = dist; }
+                }
+                prevl = l;
+            }
+            C[i] = best; chLen[i] = bl; chDist[i] = bd;
         }
-        return (toks, C[0]);
+        return (Backtrack(data, chLen, chDist), C[0]);
     }
 
     public static long TokensCost(List<Tok> toks)

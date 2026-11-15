@@ -105,11 +105,20 @@ public static class SelfTest
                 Assert(c == Lz.TokensCost(d) && c <= Lz.TokensCost(g), "dp cost");
             }
         });
+        Check("dp-iter: exact expansion, extra passes never grow the block", () =>
+        {
+            foreach (var inp in new[] { Repeat("hello world ", 300), Repeat("abcab ", 200), Rand(8, 2000) })
+            {
+                var (toks, hist) = Codec.ParseDpIter(inp, 4096, 32, 4, 3);
+                Assert(Lz.Expand(toks).SequenceEqual(inp), "expand");
+                Assert(hist.Count == 4 && Huffman.EncodeTokens(toks).Length <= hist[0], "monotone");
+            }
+        });
         Check("block codec roundtrip (all strategies, edge inputs)", () =>
         {
             var inputs = new List<byte[]> { Array.Empty<byte>(), new byte[] { 65 }, Enumerable.Repeat((byte)65, 5000).ToArray(), Repeat("hello world ", 500), Rand(2, 3000) };
             foreach (var inp in inputs)
-                foreach (int s in new[] { Strategy.Greedy, Strategy.Lazy, Strategy.Dp })
+                foreach (int s in new[] { Strategy.Greedy, Strategy.Lazy, Strategy.Dp, Strategy.Dp2 })
                 {
                     var p = new CodecParams { Strategy = s };
                     var (flag, coded) = Codec.EncodeBlock(inp, p);
@@ -142,6 +151,19 @@ public static class SelfTest
             ExpectCode("E_HMAC", () => Fmt.OpenVolume(b, "algo2026"));
             ExpectCode("E_HMAC", () => Fmt.OpenVolume(d, "wrong"));
             foreach (int cut in new[] { 0, 3, 40, 41, 72, d.Length - 1 }) { int c = cut; ExpectCode("E_LENGTH", () => Fmt.OpenVolume(d[..c], "algo2026")); }
+        });
+        Check("list + verify (multi-volume), nothing written, wrong password / missing volume rejected", () =>
+        {
+            string src = MakeDir(new() { ["a.txt"] = Repeat("hello ", 5000), ["b.bin"] = Rand(6, 30000) }), tmp = TempDir();
+            var cfg = new SarcConfig { MaxVolume = 16384 }; cfg.Params.BlockSize = 4096;
+            var outs = Archiver.Create(src, tmp + "/a", "algo2026", cfg);
+            Assert(outs.Count > 1, "expected several volumes");
+            var (files, tot) = Archiver.ListArchive(new[] { tmp + "/a" }, "algo2026");
+            Assert(tot == outs.Count && files.Select(f => f.Name).SequenceEqual(new[] { "a.txt", "b.bin" }), "table");
+            Assert(Archiver.Verify(new[] { tmp + "/a" }, "algo2026") == 2, "verify");
+            ExpectCode("E_HMAC", () => Archiver.Verify(new[] { tmp + "/a" }, "wrong"));
+            ExpectCode("E_VOLUME_MISSING", () => Archiver.ListArchive(outs.Skip(1).ToList(), "algo2026"));
+            Assert(!Directory.Exists(tmp + "/o"), "verify/list must not write files");
         });
         Check("C12 volumes: any order, missing, duplicate, big file split into blocks", () =>
         {
