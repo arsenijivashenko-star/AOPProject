@@ -1,0 +1,31 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install cryptography numpy matplotlib coverage
+      - name: unit + acceptance tests with coverage
+        working-directory: python
+        env: { SARC_PROJECT: '${{ github.workspace }}' }
+        run: |
+          coverage run --source=. -m unittest -v tests/test_sarc.py
+          coverage report --omit='tests/*,run_ga.py,report.py,iter_report.py'
+  csharp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: '9.0.x' }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install cryptography numpy
+      - name: build
+        run: dotnet build csharp -c Release -nologo
+      - name: selftest (C1 / C2 / C5 + teacher's reference archives)
+        run: dotnet run --project csharp -c Release --no-build -- selftest .
+      - name: Python <-> C# cross-compatibility
+        run: tools/crosscheck.sh
