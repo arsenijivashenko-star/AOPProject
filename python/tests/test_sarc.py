@@ -34,6 +34,20 @@ class IterativeDP(Base):
         files = {'a.txt': b'abracadabra ' * 300 + bytes(range(256)) * 4, 'b.dat': b'', 'c.bin': b'\x00' * 5000}
         self.roundtrip(files, archive.Config(params=codec.Params(strategy=codec.DP2)))
 
+class ListVerify(Base):
+    def test_list_and_verify_multivolume(self):
+        src = mk({'a.txt': b'hello ' * 5000, 'b.bin': os.urandom(30000)})
+        outs = archive.create(src, self.tmp + '/a', PW, archive.Config(max_volume=16384, params=codec.Params(block_size=4096)))
+        self.assertGreater(len(outs), 1)
+        files, tot = archive.list_archive(self.tmp + '/a', PW)
+        self.assertEqual((tot, [f['name'] for f in files]), (len(outs), ['a.txt', 'b.bin']))
+        self.assertEqual(archive.verify(self.tmp + '/a', PW), 2)
+        with self.assertRaises(SarcError) as c: archive.verify(self.tmp + '/a', 'wrong')
+        self.assertEqual(c.exception.code, 'E_HMAC')
+        with self.assertRaises(SarcError) as c: archive.list_archive(outs[1:], PW)
+        self.assertEqual(c.exception.code, 'E_VOLUME_MISSING')
+        self.assertFalse(os.path.exists(self.tmp + '/o'))      # verify/list never write extracted files
+
 class C1(Base):
     def test01_single_text(self): self.roundtrip({'a.txt': b'hello world, hello archive! ' * 40})
     def test02_empty_and_one_byte(self): self.roundtrip({'e.dat': b'', 'o.dat': b'x'})

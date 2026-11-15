@@ -197,3 +197,27 @@ def extract(archive, outdir, password):
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return sorted(data)
+
+def list_archive(arg, password):
+    """File table of a (multi-volume) archive WITHOUT decoding block data: header -> HMAC -> payload structure checked.
+    Returns (files, vol_count) with files = [{name,size,crc,type,strat,volumes:[...]}]."""
+    vols = find_volumes(arg); cache = {}; seen = set(); tot = None; table = {}
+    for p in vols:
+        with open(p, 'rb') as f: d = f.read()
+        h, pt = open_volume(d, password, cache)
+        if tot is None: tot = h['tot']
+        elif h['tot'] != tot: raise SarcError('E_PAYLOAD', 'volumes belong to different sets')
+        if h['idx'] in seen: raise SarcError('E_VOLUME_DUP', f"volume {h['idx']} supplied twice")
+        seen.add(h['idx'])
+        fl, bl = parse_payload(pt)
+        for f in fl: table.setdefault(f['name'], dict(f, volumes=[]))
+        for b in bl:
+            v = table[fl[b['fi']]['name']]['volumes']
+            if h['idx'] not in v: v.append(h['idx'])
+    missing = [i for i in range(tot) if i not in seen]
+    if missing: raise SarcError('E_VOLUME_MISSING', f'missing volume(s) {missing}')
+    return sorted(table.values(), key=lambda f: f['name']), tot
+
+def verify(arg, password):
+    """Full integrity check (HMAC, structure, decompression, size, CRC32 of every file) with nothing written to disk."""
+    return len(decode_archive(find_volumes(arg), password))
