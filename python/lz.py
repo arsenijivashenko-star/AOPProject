@@ -79,15 +79,26 @@ LIT_COST = 9
 def ref_cost(dist):
     return 17 + max(0, (dist - 1).bit_length() - 1)
 
-def parse_dp(data, window=MAX_WINDOW, depth=32, min_match=MIN_MATCH, costs=None):
-    """Optimal parsing. C[i] = min(lit + C[i+1], min_{(d,l) in M_i} cost(d,l) + C[i+l]); computed from the end.
-    Candidate set per position: for every length l the NEAREST distance (cheapest extra bits)."""
-    n = len(data)
-    if n == 0: return []
-    lit, refc = costs if costs else (LIT_COST, ref_cost)
+def _candidates_all(data, window, depth, min_match):
     mf = MatchFinder(data, window, depth, min_match)
-    cand = [None] * n
-    for i in range(n): cand[i] = mf.candidates(i)      # forward pass: finder needs ascending insertion
+    return [mf.candidates(i) for i in range(len(data))]      # forward pass: finder needs ascending insertion
+
+def _backtrack(data, choice):
+    toks = []; i = 0; n = len(data)
+    while i < n:
+        ch = choice[i]
+        if ch is None: toks.append(('L', data[i])); i += 1
+        else: toks.append(('M', ch[0], ch[1])); i += ch[0]
+    return toks
+
+def parse_dp(data, window=MAX_WINDOW, depth=32, min_match=MIN_MATCH, costs=None, cand=None):
+    """Optimal parsing. C[i] = min(lit + C[i+1], min_{(d,l) in M_i} cost(d,l) + C[i+l]); computed from the end.
+    Candidate set per position: for every length l the NEAREST distance (cheapest extra bits).
+    Costs are FIXED for the pass (team_config.json table by default), so the recursion is well defined."""
+    n = len(data)
+    if n == 0: return [], 0
+    lit, refc = costs if costs else (LIT_COST, ref_cost)
+    if cand is None: cand = _candidates_all(data, window, depth, min_match)
     C = np.zeros(n + 1, dtype=np.int64); choice = [None] * n
     for i in range(n - 1, -1, -1):
         best = lit + C[i + 1]; ch = None
@@ -101,12 +112,33 @@ def parse_dp(data, window=MAX_WINDOW, depth=32, min_match=MIN_MATCH, costs=None)
                 if v < best: best = v; ch = (lo + k, dist)
                 prevl = l
         C[i] = best; choice[i] = ch
-    toks = []; i = 0
-    while i < n:
-        ch = choice[i]
-        if ch is None: toks.append(('L', data[i])); i += 1
-        else: toks.append(('M', ch[0], ch[1])); i += ch[0]
-    return toks, int(C[0])
+    return _backtrack(data, choice), int(C[0])
+
+def parse_dp_costs(data, lit_bits, len_bits, dist_bits, esc_bits, window=MAX_WINDOW, depth=32, min_match=MIN_MATCH, cand=None):
+    """Optimal parsing with per-symbol costs taken from Huffman code lengths of a PREVIOUS pass (second cost variant in
+    the spec). lit_bits[b]: literal b; len_bits[l-3]: length symbol; dist_bits[slot]: distance slot (extra bits added here);
+    esc_bits: the marker 256 in the literal tree. Costs are constant during the pass => no circular dependency.
+    Unlike parse_dp the reference cost depends on the length too, so the argmin runs over len_bits[...] + C[...]."""
+    n = len(data)
+    if n == 0: return [], 0
+    if cand is None: cand = _candidates_all(data, window, depth, min_match)
+    lb = np.asarray(len_bits, dtype=np.int64)
+    C = np.zeros(n + 1, dtype=np.int64); choice = [None] * n
+    for i in range(n - 1, -1, -1):
+        best = int(lit_bits[data[i]]) + C[i + 1]; ch = None
+        c = cand[i]
+        if c:
+            prevl = max(MIN_MATCH, min_match) - 1
+            for (l, dist) in c:
+                lo = prevl + 1
+                ds = (dist - 1).bit_length()
+                base = esc_bits + dist_bits[ds] + max(0, ds - 1)
+                seg = C[i + lo:i + l + 1] + lb[lo - 3:l - 2]
+                k = int(np.argmin(seg)); v = base + seg[k]
+                if v < best: best = v; ch = (lo + k, dist)
+                prevl = l
+        C[i] = best; choice[i] = ch
+    return _backtrack(data, choice), int(C[0])
 
 def tokens_cost(toks):
     return sum(LIT_COST if t[0] == 'L' else ref_cost(t[2]) for t in toks)

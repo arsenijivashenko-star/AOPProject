@@ -21,6 +21,19 @@ class Base(unittest.TestCase):
         for n, b in files.items(): self.assertEqual(open(self.tmp + '/o/' + n, 'rb').read(), b, n)
         shutil.rmtree(src); return outs, st
 
+class IterativeDP(Base):
+    """Expert level (case 19): extra passes never grow the block; round-trip stays byte-exact."""
+    def test_iter_never_worse_than_pass0_and_roundtrips(self):
+        for n in ['f0000.txt', 'f0001.py', 'f0002.csv', 'f0003.pgm']:
+            d = open(ROOT + '/corpus/' + n, 'rb').read()[:8192]
+            toks, hist = codec.parse_dp_iter(d, 4096, 32, 4, 3)
+            self.assertEqual(lz.expand(toks), d)
+            self.assertLessEqual(len(huff.encode_tokens(toks)), hist[0])
+            self.assertLessEqual(len(codec.encode_block(d, codec.Params(strategy=codec.DP2))[1]), len(codec.encode_block(d, codec.Params(strategy=codec.DP))[1]))
+    def test_iter_archive_roundtrip(self):
+        files = {'a.txt': b'abracadabra ' * 300 + bytes(range(256)) * 4, 'b.dat': b'', 'c.bin': b'\x00' * 5000}
+        self.roundtrip(files, archive.Config(params=codec.Params(strategy=codec.DP2)))
+
 class C1(Base):
     def test01_single_text(self): self.roundtrip({'a.txt': b'hello world, hello archive! ' * 40})
     def test02_empty_and_one_byte(self): self.roundtrip({'e.dat': b'', 'o.dat': b'x'})

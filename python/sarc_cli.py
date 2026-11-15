@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """SARC smart secure archiver - command line.
-  sarc_cli.py archive INPUT OUTPUT_BASE -p PASSWORD [--max-volume N] [--strategy greedy|lazy|dp] [--recursive]
+  sarc_cli.py archive INPUT OUTPUT_BASE -p PASSWORD [--max-volume N] [--strategy greedy|lazy|dp|dp-iter] [--recursive]
   sarc_cli.py extract ARCHIVE OUTDIR -p PASSWORD        (ARCHIVE: base name, a .arc file, or several volume files)
   sarc_cli.py info VOLUME.arc                           (public header only; nothing is decrypted)
   sarc_cli.py train DATA_ROOT                           (train the perceptron classifier on train/ + valid/)
@@ -13,7 +13,7 @@ import archive, codec
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL = os.path.join(HERE, 'model.json')
-STRATS = {'greedy': codec.GREEDY, 'lazy': codec.LAZY, 'dp': codec.DP}
+STRATS = {'greedy': codec.GREEDY, 'lazy': codec.LAZY, 'dp': codec.DP, 'dp-iter': codec.DP2}
 
 def _pw(a):
     if a.password is not None: return a.password

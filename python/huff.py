@@ -32,8 +32,8 @@ class BitWriter:
         if self.n: self.buf.append((self.acc << (8 - self.n)) & 0xff); self.n = 0
         return bytes(self.buf)
 
-def encode_tokens(toks):
-    """tokens -> coded block body (3 trees + counts + bitstream). Returns bytes."""
+def token_code_lengths(toks):
+    """Huffman code lengths of the three trees (literal+marker 256 / length-3 / distance slot) for a token list."""
     lf = {}; mf = {}; df = {}
     for t in toks:
         if t[0] == 'L': lf[t[1]] = lf.get(t[1], 0) + 1
@@ -41,7 +41,11 @@ def encode_tokens(toks):
             lf[256] = lf.get(256, 0) + 1
             mf[t[1] - 3] = mf.get(t[1] - 3, 0) + 1
             ds = (t[2] - 1).bit_length(); df[ds] = df.get(ds, 0) + 1
-    L = code_lengths(lf); M = code_lengths(mf); D = code_lengths(df)
+    return code_lengths(lf), code_lengths(mf), code_lengths(df)
+
+def encode_tokens(toks):
+    """tokens -> coded block body (3 trees + counts + bitstream). Returns bytes."""
+    L, M, D = token_code_lengths(toks)
     def table(lens):
         if len(lens) == 1: return {s: (0, 1) for s in lens}
         return canon_codes(list(lens.items()))
