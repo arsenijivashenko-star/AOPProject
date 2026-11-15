@@ -1,13 +1,15 @@
 # SARC smart secure archiver (Python reference implementation)
 Run from this folder (needs python3.10+, `pip install cryptography numpy matplotlib`).
 ```
-python3 sarc_cli.py archive INPUT_DIR OUT_BASE -p PASSWORD [--max-volume 65536] [--strategy lazy|greedy|dp] [--recursive]
+python3 sarc_cli.py archive INPUT_DIR OUT_BASE -p PASSWORD [--max-volume 65536] [--strategy lazy|greedy|dp|dp-iter] [--recursive]
 python3 sarc_cli.py extract OUT_BASE OUTDIR -p PASSWORD      # base name, .arc file(s) in any order
+python3 sarc_cli.py list OUT_BASE -p PASSWORD                  # file table (names, sizes, CRC32, strategy, volumes)
+python3 sarc_cli.py verify OUT_BASE -p PASSWORD                # full integrity check, writes nothing
 python3 sarc_cli.py info OUT_BASE.part0.arc
 python3 sarc_cli.py train PROJECT_ROOT                       # retrain perceptron (train/ + valid/ -> model.json)
 python3 sarc_cli.py attack integrity OUT_BASE.arc -p PASSWORD
 python3 sarc_cli.py attack weak FILE --cipher xor|vigenere --data PROJECT_ROOT --out recovered.bin
-python3 run_ga.py 40 ; python3 report.py                     # GA experiment, report tables
+python3 run_ga.py 40 ; python3 report.py ; python3 iter_report.py ..                    # GA experiment, report tables
 SARC_PROJECT=/path/to/Project python3 -m unittest -v tests/test_sarc.py
 ```
 Errors: E_MAGIC E_VERSION E_LENGTH E_HMAC E_PAYLOAD E_CRC E_VOLUME_MISSING E_VOLUME_DUP E_CAPACITY E_INPUT.
@@ -24,6 +26,7 @@ Keys: PBKDF2-HMAC-SHA256 100k it, 64 B -> K_enc | K_mac, once per archive. Nonce
 - Implemented in Python, not in the C# prototype (no .NET available to build/test here). The old C# in src/ was a non-working draft.
 - GA: no significant gain over random/local search at budget 40 (all ~0.796 Q; differences below timing noise). Landscape is flat; fitness uses wall time.
 - Weak-cipher attack: XOR and Vigenere keys recovered exactly in tests; substitution over the full byte alphabet is NOT solved (experimental).
+- `dp-iter` strategy (iterative DP with Huffman-derived costs, REPORT_TABLES.md §7) is the densest parser: ~1.4% below fixed-cost DP, ~2.7% below lazy on the corpus; ~5x slower than lazy.
 - Not implemented: metadata attack, arithmetic coding, byte predictor, DH/RSA, block-size alignment, DP block splitting, streaming of coded blocks (coded blocks are held in RAM; input read per block).
 - Perceptron macro-F1 on valid/: 0.9905 (F1_min 0.61). holdout/ not available.
 - Knapsack W uses 41+32+6+table and weight=coded+15 (the "-15*blocks" term in team_config would double-count).
