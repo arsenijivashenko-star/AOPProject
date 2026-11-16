@@ -2,7 +2,7 @@
 
 | folder | content |
 |---|---|
-| `python/` | tested reference implementation (31 tests pass; `dp-iter` parser, `list`/`verify` commands), GA, attacks, report generator — see `python/README.md` |
+| `python/` | tested reference implementation (47 tests pass; `dp-iter` parser, `list`/`verify` commands), GA, attacks, report generator — see `python/README.md` |
 | `csharp/` | .NET 9 port of the core (NOT compiled yet — run `selftest` first) — see `csharp/README.md` |
 | `corpus/ train/ valid/ reference/ team_config.json` | teacher-issued data and reference archives |
 
@@ -10,4 +10,5 @@ Quick start (Python): `cd python && python3 tests/test_sarc.py`
 Quick start (C#): `cd csharp && dotnet run -c Release -- selftest ..`
 `python/META-USAGE.md` documents the AI assistance used.
 
+New CLI features (profiles, `--only`, `--dry-run`, `--json`, `--progress`, `--password-file`): see `python/README.md`.
 Plans and priorities: see `ROADMAP.md`.

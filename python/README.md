@@ -1,8 +1,10 @@
 # SARC smart secure archiver (Python reference implementation)
 Run from this folder (needs python3.10+, `pip install cryptography numpy matplotlib`).
 ```
-python3 sarc_cli.py archive INPUT_DIR OUT_BASE -p PASSWORD [--max-volume 65536] [--strategy lazy|greedy|dp|dp-iter] [--recursive]
+python3 sarc_cli.py archive INPUT_DIR OUT_BASE -p PASSWORD [--max-volume 65536] [--profile fast|balanced|best | --strategy lazy|greedy|dp|dp-iter] [--recursive]
+python3 sarc_cli.py archive INPUT_DIR OUT_BASE --dry-run [--json]   # plan volumes, predict exact size, write nothing (no password needed)
 python3 sarc_cli.py extract OUT_BASE OUTDIR -p PASSWORD      # base name, .arc file(s) in any order
+python3 sarc_cli.py extract OUT_BASE OUTDIR --only a.txt b.csv --password-file pw.txt   # selected files; `-` reads the password from stdin
 python3 sarc_cli.py list OUT_BASE -p PASSWORD                  # file table (names, sizes, CRC32, strategy, volumes)
 python3 sarc_cli.py verify OUT_BASE -p PASSWORD                # full integrity check, writes nothing
 python3 sarc_cli.py info OUT_BASE.part0.arc
@@ -12,6 +14,9 @@ python3 sarc_cli.py attack weak FILE --cipher xor|vigenere --data PROJECT_ROOT -
 python3 run_ga.py 40 ; python3 report.py ; python3 iter_report.py ..                    # GA experiment, report tables
 SARC_PROJECT=/path/to/Project python3 -m unittest -v tests/test_sarc.py
 ```
+Common options of archive/extract/list/verify: `--json` (one JSON object on stdout, errors too), `--progress` (bar on stderr), `--password-file FILE`.
+Password order: `-p` > `--password-file` > `$SARC_PASSWORD` > prompt. Exit codes: 0 ok, 2 SARC error, 3 I/O or memory, 130 Ctrl+C.
+Default profile is `balanced` (see REPORT_TABLES.md §8); `--no-classifier` makes every file type 6, i.e. `lazy`.
 Errors: E_MAGIC E_VERSION E_LENGTH E_HMAC E_PAYLOAD E_CRC E_VOLUME_MISSING E_VOLUME_DUP E_CAPACITY E_INPUT.
 See REPORT_TABLES.md for measured results and NOTES below.
 
