@@ -5,6 +5,10 @@ python3 sarc_cli.py archive INPUT_DIR OUT_BASE -p PASSWORD [--max-volume 65536] 
 python3 sarc_cli.py archive INPUT_DIR OUT_BASE --dry-run [--json]   # plan volumes, predict exact size, write nothing (no password needed)
 python3 sarc_cli.py extract OUT_BASE OUTDIR -p PASSWORD      # base name, .arc file(s) in any order
 python3 sarc_cli.py extract OUT_BASE OUTDIR --only a.txt b.csv --password-file pw.txt   # selected files; `-` reads the password from stdin
+python3 sarc_cli.py archive INPUT_DIR OUT_BASE -p PASSWORD --recursive --exclude '*.tmp' .git --jobs 4   # glob filters; --jobs = parallel block encoding (same bytes for any N)
+python3 sarc_cli.py diff OUT_BASE DIR -p PASSWORD [--json]     # archive vs folder without extracting: same/changed/missing/extra; exit 1 when they differ
+python3 sarc_cli.py bench DIR [--profiles fast balanced best]   # real archive+verify per profile, prints size, time and Q = 0.7*S + 0.3*T (t_ref from team_config.json)
+pip install -e .                                               # installs the `sarc` command (same CLI as sarc_cli.py)
 python3 sarc_cli.py list OUT_BASE -p PASSWORD                  # file table (names, sizes, CRC32, strategy, volumes)
 python3 sarc_cli.py verify OUT_BASE -p PASSWORD                # full integrity check, writes nothing
 python3 sarc_cli.py info OUT_BASE.part0.arc
