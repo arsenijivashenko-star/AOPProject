@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sarc-archiver"
+version = "0.2.0"
+description = "SARC: smart secure archiver (LZ77 + Huffman, knapsack volume packing, AES-CTR + HMAC)"
+requires-python = ">=3.10"
+dependencies = ["cryptography", "numpy"]
+
+[project.optional-dependencies]
+report = ["matplotlib"]
+dev = ["coverage", "ruff"]
+
+[project.scripts]
+sarc = "sarc_cli:main"
+
+[tool.setuptools]
+py-modules = ["archive", "attack", "classify", "codec", "fmt", "ga", "huff", "knapsack", "lz", "metric", "sarc_cli"]
+
+# The code base uses a deliberately dense one-line style; only real defects are checked.
+[tool.ruff]
+line-length = 200
+[tool.ruff.lint]
+select = ["E9", "F"]
+ignore = ["F403", "F405"]   # `from fmt import *` is used on purpose in archive.py
