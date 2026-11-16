@@ -47,6 +47,23 @@ class ListVerify(Base):
         with self.assertRaises(SarcError) as c: archive.list_archive(outs[1:], PW)
         self.assertEqual(c.exception.code, 'E_VOLUME_MISSING')
         self.assertFalse(os.path.exists(self.tmp + '/o'))      # verify/list never write extracted files
+    def test_selective_extraction(self):
+        src = mk({'keep.txt': b'keep me ' * 3000, 'skip.bin': os.urandom(24000), 'empty.dat': b''})
+        outs = archive.create(src, self.tmp + '/selected', PW,
+                              archive.Config(max_volume=16384, params=codec.Params(block_size=2048)))
+        outdir = self.tmp + '/selected-out'
+        names = archive.extract(self.tmp + '/selected', outdir, PW, only_names=['keep.txt', 'empty.dat'])
+        self.assertEqual(names, ['empty.dat', 'keep.txt'])
+        self.assertEqual(open(outdir + '/keep.txt', 'rb').read(), b'keep me ' * 3000)
+        self.assertEqual(open(outdir + '/empty.dat', 'rb').read(), b'')
+        self.assertFalse(os.path.exists(outdir + '/skip.bin'))
+        with self.assertRaises(SarcError) as c:
+            archive.extract(self.tmp + '/selected', self.tmp + '/missing-out', PW, only_names=['not-there.txt'])
+        self.assertEqual(c.exception.code, 'E_INPUT')
+        self.assertFalse(os.path.exists(self.tmp + '/missing-out'))
+        with self.assertRaises(SarcError) as c:
+            archive.extract(outs[1:], self.tmp + '/incomplete-out', PW, only_names=['keep.txt'])
+        self.assertEqual(c.exception.code, 'E_VOLUME_MISSING')
 
 class C1(Base):
     def test01_single_text(self): self.roundtrip({'a.txt': b'hello world, hello archive! ' * 40})

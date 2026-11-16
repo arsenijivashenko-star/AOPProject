@@ -3,6 +3,7 @@ Run from this folder (needs python3.10+, `pip install cryptography numpy matplot
 ```
 python3 sarc_cli.py archive INPUT_DIR OUT_BASE -p PASSWORD [--max-volume 65536] [--strategy lazy|greedy|dp|dp-iter] [--recursive]
 python3 sarc_cli.py extract OUT_BASE OUTDIR -p PASSWORD      # base name, .arc file(s) in any order
+python3 sarc_cli.py extract OUT_BASE OUTDIR -p PASSWORD --only report.pdf notes.txt  # selected files only
 python3 sarc_cli.py list OUT_BASE -p PASSWORD                  # file table (names, sizes, CRC32, strategy, volumes)
 python3 sarc_cli.py verify OUT_BASE -p PASSWORD                # full integrity check, writes nothing
 python3 sarc_cli.py info OUT_BASE.part0.arc
@@ -12,6 +13,8 @@ python3 sarc_cli.py attack weak FILE --cipher xor|vigenere --data PROJECT_ROOT -
 python3 run_ga.py 40 ; python3 report.py ; python3 iter_report.py ..                    # GA experiment, report tables
 SARC_PROJECT=/path/to/Project python3 -m unittest -v tests/test_sarc.py
 ```
+Selective extraction authenticates and parses the complete volume set, but decompresses and writes only the names passed to `--only`. A missing requested name is reported as `E_INPUT`.
+
 Errors: E_MAGIC E_VERSION E_LENGTH E_HMAC E_PAYLOAD E_CRC E_VOLUME_MISSING E_VOLUME_DUP E_CAPACITY E_INPUT.
 See REPORT_TABLES.md for measured results and NOTES below.
 

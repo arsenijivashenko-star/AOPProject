@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """SARC smart secure archiver - command line.
   sarc_cli.py archive INPUT OUTPUT_BASE -p PASSWORD [--max-volume N] [--strategy greedy|lazy|dp|dp-iter] [--recursive]
-  sarc_cli.py extract ARCHIVE OUTDIR -p PASSWORD        (ARCHIVE: base name, a .arc file, or several volume files)
+  sarc_cli.py extract ARCHIVE OUTDIR -p PASSWORD [--only NAME ...]  (ARCHIVE: base name, a .arc file, or several volume files)
   sarc_cli.py list ARCHIVE -p PASSWORD                  (file table: names, sizes, CRC32, type, strategy, volumes)
   sarc_cli.py verify ARCHIVE -p PASSWORD                (full integrity check, writes nothing)
   sarc_cli.py info VOLUME.arc                           (public header only; nothing is decrypted)
@@ -37,8 +37,8 @@ def cmd_archive(a):
 
 def cmd_extract(a):
     arc = a.archive if len(a.archive) > 1 else a.archive[0]
-    names = archive.extract(arc, a.outdir, _pw(a))
-    print(f'extracted {len(names)} file(s) to {a.outdir}: all CRC32 verified'); return 0
+    names = archive.extract(arc, a.outdir, _pw(a), only_names=a.only)
+    print(f'extracted {len(names)} file(s) to {a.outdir}: CRC32 verified'); return 0
 
 def cmd_list(a):
     arc = a.archive if len(a.archive) > 1 else a.archive[0]
@@ -91,7 +91,7 @@ def main(argv=None):
     p.add_argument('--max-volume', type=int, default=65536); p.add_argument('--block-size', type=int, default=16384)
     p.add_argument('--strategy', choices=STRATS, default='lazy'); p.add_argument('--packer', choices=['dp', 'greedy'], default='dp')
     p.add_argument('--recursive', action='store_true'); p.add_argument('--no-classifier', action='store_true'); p.set_defaults(f=cmd_archive)
-    p = sp.add_parser('extract'); p.add_argument('archive', nargs='+'); p.add_argument('outdir'); p.add_argument('-p', '--password'); p.set_defaults(f=cmd_extract)
+    p = sp.add_parser('extract'); p.add_argument('archive', nargs='+'); p.add_argument('outdir'); p.add_argument('-p', '--password'); p.add_argument('--only', nargs='+', metavar='NAME', help='extract only the named file(s)'); p.set_defaults(f=cmd_extract)
     p = sp.add_parser('list'); p.add_argument('archive', nargs='+'); p.add_argument('-p', '--password'); p.set_defaults(f=cmd_list)
     p = sp.add_parser('verify'); p.add_argument('archive', nargs='+'); p.add_argument('-p', '--password'); p.set_defaults(f=cmd_verify)
     p = sp.add_parser('info'); p.add_argument('volumes', nargs='+'); p.set_defaults(f=cmd_info)
