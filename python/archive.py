@@ -9,11 +9,25 @@ TYPE_PRIORITY = {0: 3, 1: 3, 2: 2, 3: 2, 4: 2, 5: 1, 6: 1}      # team_config.js
 MAX_NAME_BYTES = 255
 
 class Config:
-    def __init__(self, max_volume=65536, params=None, packer='dp', classifier=None, strategy_by_type=None):
+    def __init__(self, max_volume=65536, params=None, packer='dp', classifier=None, strategy_by_type=None, progress=None):
         self.max_volume = max_volume; self.params = params or Params(); self.packer = packer
         self.classifier = classifier
+        self.progress = progress        # optional callable(done_bytes, total_bytes), called after every encoded block
         # per-type strategy chosen by the analysis block; type 5 (already compressed) -> store
         self.strategy_by_type = strategy_by_type or {5: STORE}
+
+# Profiles = which parser each detected file type gets (type ids: 0 text, 1 code, 2 structured, 3 raster, 4 exe, 5 already
+# compressed, 6 artificial). Measured on corpus/ (REPORT_TABLES.md section 8): dp-iter gains 5-8% over lazy on text/code/
+# structured data and 2-3% on raster/exe, while types 5 and 6 are incompressible, so spending time there is wasted.
+PROFILES = {
+    'fast':     {t: LAZY for t in range(7)} | {5: STORE},
+    'balanced': {0: DP2, 1: DP2, 2: DP2, 3: DP, 4: DP, 5: STORE, 6: LAZY},
+    'best':     {t: DP2 for t in range(7)} | {5: STORE},
+}
+
+def profile_strategies(name):
+    if name not in PROFILES: raise SarcError('E_INPUT', f'unknown profile {name!r}; choose from {sorted(PROFILES)}')
+    return dict(PROFILES[name])
 
 def _validate_input(path):
     if not os.path.isfile(path): raise SarcError('E_INPUT', f'not a file: {os.path.basename(path)}')
@@ -43,6 +57,7 @@ class Cand:     # candidate block
 def analyze_and_encode(paths, cfg, stats=None):
     """Returns (files, cands). files: list of dict(name,size,crc,type,strat). Blocks are encoded BEFORE packing."""
     files = []; cands = []; bs = cfg.params.block_size
+    total_bytes = sum(os.path.getsize(p) for p in paths if os.path.isfile(p)); done = 0
     for fi, path in enumerate(paths):
         _validate_input(path)
         size = os.path.getsize(path)
@@ -55,8 +70,9 @@ def analyze_and_encode(paths, cfg, stats=None):
             while True:
                 raw = f.read(bs)
                 if not raw and bi > 0: break
-                crc = crc32(raw, crc); total += len(raw)
+                crc = crc32(raw, crc); total += len(raw); done += len(raw)
                 flag, coded = encode_block(raw, p)
+                if cfg.progress: cfg.progress(done, total_bytes)
                 c = Cand(); c.file = fi; c.idx = bi; c.raw = len(raw); c.flag = flag; c.coded = coded
                 c.value = TYPE_PRIORITY.get(ftype, 1) * (len(raw) + 1)
                 cands.append(c); bi += 1
@@ -106,6 +122,22 @@ def seal_volume(payload, ke, km, salt, nonce_prefix, idx, total):
     assert len(head) == HDR
     return head + ct + hmac.new(km, head + ct, hashlib.sha256).digest()
 
+def dry_run(input_path, cfg=None, recursive=False):
+    """Plan an archive WITHOUT writing anything: encodes all blocks (weights must be exact), solves the knapsack for every
+    volume and returns the exact size the archive would have. No password / key derivation is needed."""
+    cfg = cfg or Config(); t0 = time.time()
+    paths = collect(input_path, recursive)
+    if not paths: raise SarcError('E_INPUT', 'no input files')
+    if len(paths) > 65535: raise SarcError('E_INPUT', 'too many files')
+    st = {}
+    files, cands = analyze_and_encode(paths, cfg, st)
+    plan, info = plan_volumes(files, cands, cfg.max_volume, cfg.packer)
+    vols = [len(build_payload(files, fset, blocks)) + HDR + TAG for fset, blocks in plan]
+    for i, v in enumerate(vols): info[i]['volume_bytes'] = v
+    orig = sum(f['size'] for f in files)
+    return dict(files=files, volumes=len(plan), vol_info=info, volume_bytes=vols, arc_bytes=sum(vols), orig_bytes=orig,
+                blocks=len(cands), max_volume=cfg.max_volume, seconds=time.time() - t0)
+
 def create(input_path, out_base, password, cfg=None, recursive=False, stats=None):
     """Returns list of written volume paths. Raises SarcError."""
     cfg = cfg or Config()
@@ -144,8 +176,10 @@ def find_volumes(arg):
     if os.path.isfile(arg + '.arc'): return [arg + '.arc']
     raise SarcError('E_INPUT', 'archive not found')
 
-def decode_archive(vol_paths, password):
-    """Returns {name: bytes}; verifies every volume (header -> HMAC -> payload -> CRC32). Nothing is written."""
+def decode_archive(vol_paths, password, only=None):
+    """Returns {name: bytes}; verifies every volume (header -> HMAC -> payload -> CRC32). Nothing is written.
+    only: optional collection of file names. Every volume is still authenticated (HMAC) and the whole file table is
+    checked, but block data is decoded (and CRC32-checked) just for the requested files."""
     if not vol_paths: raise SarcError('E_INPUT', 'no volumes')
     cache = {}; seen = {}; tot = None; metas = {}; blocks = {}
     for p in vol_paths:
@@ -166,7 +200,11 @@ def decode_archive(vol_paths, password):
     missing = [i for i in range(tot) if i not in seen]
     if missing: raise SarcError('E_VOLUME_MISSING', f'missing volume(s) {missing}')
     out = {}
+    if only is not None:
+        only = list(dict.fromkeys(only)); unknown = [n for n in only if n not in metas]
+        if unknown: raise SarcError('E_INPUT', f'not in archive: {unknown[:3]}')
     for name, m in metas.items():
+        if only is not None and name not in only: continue
         bl = blocks.get(name, {}); idxs = sorted(bl)
         if idxs != list(range(len(idxs))): raise SarcError('E_PAYLOAD', 'block gap')
         buf = bytearray()
@@ -183,10 +221,11 @@ def decode_archive(vol_paths, password):
         out[name] = bytes(buf)
     return out
 
-def extract(archive, outdir, password):
-    """Atomic: decode+verify everything first, write into a temp dir inside outdir, then move into place."""
+def extract(archive, outdir, password, only=None):
+    """Atomic: decode+verify everything first, write into a temp dir inside outdir, then move into place.
+    only: optional list of file names to extract (the others are authenticated but not decoded)."""
     vols = find_volumes(archive)
-    data = decode_archive(vols, password)
+    data = decode_archive(vols, password, only)
     os.makedirs(outdir, exist_ok=True)
     tmp = tempfile.mkdtemp(prefix='.sarc_', dir=outdir)
     try:
