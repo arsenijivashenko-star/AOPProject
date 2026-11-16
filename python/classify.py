@@ -84,13 +84,16 @@ def macro_f1(y, p, K=7):
 
 def load_split(d):
     X = []; y = []
-    for row in csv.DictReader(open(os.path.join(d, 'labels.csv'), encoding='utf-8')):
-        X.append(features(open(os.path.join(d, row['file']), 'rb').read())); y.append(int(row['type']))
+    with open(os.path.join(d, 'labels.csv'), encoding='utf-8') as lf: rows = list(csv.DictReader(lf))
+    for row in rows:
+        with open(os.path.join(d, row['file']), 'rb') as f: X.append(features(f.read()))
+        y.append(int(row['type']))
     return np.array(X), np.array(y)
 
 class Classifier:
     def __init__(self, path):
-        j = json.load(open(path)); self.mu = np.array(j['mu']); self.sd = np.array(j['sd']); self.net = MLP.from_json(j['net'])
+        with open(path, encoding='utf-8') as f: j = json.load(f)
+        self.mu = np.array(j['mu']); self.sd = np.array(j['sd']); self.net = MLP.from_json(j['net'])
     def __call__(self, data: bytes) -> int:
         x = (features(data) - self.mu) / self.sd
         return int(self.net.predict(x[None, :])[0])
@@ -103,5 +106,5 @@ def train(root, out_path, seeds=(1, 2, 3), hidden=(48, 24)):
         net = MLP([NFEAT, *hidden, 7], seed=s); net.fit(A, ytr, seed=s)
         f1, cm = macro_f1(yva, net.predict(B)); ftr, _ = macro_f1(ytr, net.predict(A)); log.append((s, ftr, f1))
         if best is None or f1 > best[0]: best = (f1, net, cm, s)
-    json.dump(dict(mu=mu.tolist(), sd=sd.tolist(), net=best[1].to_json(), valid_macro_f1=best[0], seed=best[3], seeds=log), open(out_path, 'w'))
+    with open(out_path, 'w', encoding='utf-8') as of: json.dump(dict(mu=mu.tolist(), sd=sd.tolist(), net=best[1].to_json(), valid_macro_f1=best[0], seed=best[3], seeds=log), of)
     return best[0], best[2], log

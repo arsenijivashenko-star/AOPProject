@@ -1,14 +1,21 @@
 """Acceptance tests C1 (12 cases) + edge cases C2 + security C5.  Run: python3 -m unittest -v test_sarc"""
-import os, sys, json, glob, random, shutil, struct, tempfile, unittest, zlib, itertools
+import io, os, sys, json, glob, random, shutil, struct, tempfile, unittest, zlib, itertools
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import archive, codec, lz, huff, knapsack, fmt, attack
 from fmt import SarcError, crc32
 ROOT = os.environ.get('SARC_PROJECT', os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 PW = 'algo2026'
 
+def rb(path):
+    with open(path, 'rb') as f: return f.read()
+def wb(path, data):
+    with open(path, 'wb') as f: f.write(data)
+def rj(path):
+    with open(path, encoding='utf-8') as f: return json.load(f)
+
 def mk(files):
     d = tempfile.mkdtemp(prefix='sarc_t_')
-    for n, b in files.items(): open(os.path.join(d, n), 'wb').write(b)
+    for n, b in files.items(): wb(os.path.join(d, n), b)
     return d
 
 class Base(unittest.TestCase):
@@ -18,14 +25,14 @@ class Base(unittest.TestCase):
         src = mk(files); st = {}
         outs = archive.create(src, self.tmp + '/a', pw, cfg, stats=st)
         archive.extract(self.tmp + '/a', self.tmp + '/o', pw)
-        for n, b in files.items(): self.assertEqual(open(self.tmp + '/o/' + n, 'rb').read(), b, n)
+        for n, b in files.items(): self.assertEqual(rb(self.tmp + '/o/' + n), b, n)
         shutil.rmtree(src); return outs, st
 
 class IterativeDP(Base):
     """Expert level (case 19): extra passes never grow the block; round-trip stays byte-exact."""
     def test_iter_never_worse_than_pass0_and_roundtrips(self):
         for n in ['f0000.txt', 'f0001.py', 'f0002.csv', 'f0003.pgm']:
-            d = open(ROOT + '/corpus/' + n, 'rb').read()[:8192]
+            d = rb(ROOT + '/corpus/' + n)[:8192]
             toks, hist = codec.parse_dp_iter(d, 4096, 32, 4, 3)
             self.assertEqual(lz.expand(toks), d)
             self.assertLessEqual(len(huff.encode_tokens(toks)), hist[0])
@@ -33,6 +40,110 @@ class IterativeDP(Base):
     def test_iter_archive_roundtrip(self):
         files = {'a.txt': b'abracadabra ' * 300 + bytes(range(256)) * 4, 'b.dat': b'', 'c.bin': b'\x00' * 5000}
         self.roundtrip(files, archive.Config(params=codec.Params(strategy=codec.DP2)))
+
+class SelectiveExtract(Base):
+    """ROADMAP A: --only extracts chosen files; every volume is still authenticated."""
+    FILES = {'a.txt': b'alpha beta gamma ' * 400, 'b.csv': b'1,2,3\n' * 900, 'c.bin': bytes(range(256)) * 20}
+    def make(self, **kw):
+        src = mk(self.FILES); archive.create(src, self.tmp + '/a', PW, archive.Config(**kw)); shutil.rmtree(src)
+    def test_only_writes_just_requested_files(self):
+        self.make()
+        names = archive.extract(self.tmp + '/a', self.tmp + '/o', PW, only=['b.csv'])
+        self.assertEqual(names, ['b.csv']); self.assertEqual(os.listdir(self.tmp + '/o'), ['b.csv'])
+        self.assertEqual(rb(self.tmp + '/o/b.csv'), self.FILES['b.csv'])
+    def test_only_unknown_name_is_controlled_error_and_writes_nothing(self):
+        self.make()
+        with self.assertRaises(SarcError) as c: archive.extract(self.tmp + '/a', self.tmp + '/o', PW, only=['nope.txt'])
+        self.assertEqual(c.exception.code, 'E_INPUT'); self.assertFalse(os.path.exists(self.tmp + '/o'))
+    def test_only_still_authenticates_whole_volume(self):
+        self.make(); d = bytearray(rb(self.tmp + '/a.arc')); d[len(d) // 2] ^= 1; wb(self.tmp + '/a.arc', bytes(d))
+        with self.assertRaises(SarcError) as c: archive.extract(self.tmp + '/a', self.tmp + '/o', PW, only=['a.txt'])
+        self.assertEqual(c.exception.code, 'E_HMAC')
+    def test_only_across_volumes(self):
+        self.make(max_volume=4096, params=codec.Params(block_size=1024))
+        self.assertGreater(len(glob.glob(self.tmp + '/a.part*.arc')), 1)
+        archive.extract(self.tmp + '/a', self.tmp + '/o', PW, only=['a.txt', 'c.bin'])
+        self.assertEqual(sorted(os.listdir(self.tmp + '/o')), ['a.txt', 'c.bin'])
+        self.assertEqual(rb(self.tmp + '/o/c.bin'), self.FILES['c.bin'])
+
+class DryRunAndProfiles(Base):
+    def test_dry_run_predicts_exact_size_and_writes_nothing(self):
+        src = mk({'a.txt': b'hello world ' * 3000, 'b.bin': os.urandom(20000)})
+        cfg = archive.Config(max_volume=16384, params=codec.Params(block_size=4096))
+        plan = archive.dry_run(src, cfg)
+        self.assertEqual(os.listdir(self.tmp), [])
+        outs = archive.create(src, self.tmp + '/a', PW, cfg)
+        self.assertEqual(plan['volumes'], len(outs))
+        self.assertEqual(plan['volume_bytes'], [os.path.getsize(p) for p in sorted(outs)])
+        self.assertEqual(plan['arc_bytes'], sum(os.path.getsize(p) for p in outs))
+    def test_dry_run_reports_capacity_error(self):
+        src = mk({'a.txt': b'x' * 100})
+        with self.assertRaises(SarcError) as c: archive.dry_run(src, archive.Config(max_volume=60))
+        self.assertEqual(c.exception.code, 'E_CAPACITY')
+    def test_profiles_roundtrip_and_strategy_recorded(self):
+        files = {'t.txt': rb(ROOT + '/corpus/f0000.txt'), 'p.py': rb(ROOT + '/corpus/f0001.py')}
+        sizes = {}
+        for prof in archive.PROFILES:
+            clf = None
+            if os.path.isfile(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'model.json')):
+                import classify; clf = classify.Classifier(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'model.json'))
+            cfg = archive.Config(strategy_by_type=archive.profile_strategies(prof), classifier=clf)
+            src = mk(files); st = {}; outs = archive.create(src, self.tmp + '/' + prof, PW, cfg, stats=st)
+            archive.extract(self.tmp + '/' + prof, self.tmp + '/o_' + prof, PW)
+            for n, b in files.items(): self.assertEqual(rb(f'{self.tmp}/o_{prof}/{n}'), b)
+            sizes[prof] = st['arc_bytes']
+        self.assertLessEqual(sizes['balanced'], sizes['fast']); self.assertLessEqual(sizes['best'], sizes['fast'])
+    def test_unknown_profile_rejected(self):
+        with self.assertRaises(SarcError): archive.profile_strategies('turbo')
+    def test_progress_callback_monotone_and_reaches_total(self):
+        src = mk({'a.txt': b'abc ' * 9000, 'b.dat': b'z' * 5000}); seen = []
+        archive.dry_run(src, archive.Config(params=codec.Params(block_size=4096), progress=lambda d, t: seen.append((d, t))))
+        self.assertEqual(seen[-1][0], seen[-1][1]); self.assertEqual(seen, sorted(seen))
+
+class CliFeatures(Base):
+    def run_cli(self, *argv, stdin=None):
+        import contextlib, sarc_cli
+        out, err = io.StringIO(), io.StringIO(); old = sys.stdin
+        if stdin is not None: sys.stdin = io.StringIO(stdin)
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err): rc = sarc_cli.main(list(argv))
+        finally: sys.stdin = old
+        return rc, out.getvalue(), err.getvalue()
+    def setUp(self):
+        super().setUp(); self.src = mk({'a.txt': b'hello cli ' * 800, 'b.csv': b'1;2;3\n' * 500})
+    def test_json_archive_list_verify_extract_with_password_file(self):
+        pf = self.tmp + '/pw.txt'; wb(pf, PW.encode() + b'\n')
+        rc, out, _ = self.run_cli('archive', self.src, self.tmp + '/a', '--password-file', pf, '--json')
+        self.assertEqual(rc, 0); j = json.loads(out); self.assertEqual(j['files'], 2); self.assertGreater(j['ratio'], 1)
+        rc, out, _ = self.run_cli('list', self.tmp + '/a', '--password-file', pf, '--json')
+        self.assertEqual([f['name'] for f in json.loads(out)['files']], ['a.txt', 'b.csv'])
+        rc, out, _ = self.run_cli('verify', self.tmp + '/a', '--password-file', pf, '--json'); self.assertEqual(json.loads(out), {'ok': True, 'files_verified': 2})
+        rc, out, _ = self.run_cli('extract', self.tmp + '/a', self.tmp + '/o', '--only', 'b.csv', '--password-file', pf, '--json')
+        self.assertEqual(json.loads(out)['extracted'], ['b.csv'])
+    def test_password_from_stdin(self):
+        rc, _, _ = self.run_cli('archive', self.src, self.tmp + '/a', '--password-file', '-', stdin=PW + '\n'); self.assertEqual(rc, 0)
+        rc, _, _ = self.run_cli('verify', self.tmp + '/a', '-p', PW); self.assertEqual(rc, 0)
+    def test_empty_or_missing_password_file_is_controlled_error(self):
+        wb(self.tmp + '/e.txt', b'\n')
+        for pf in (self.tmp + '/e.txt', self.tmp + '/missing.txt'):
+            rc, out, err = self.run_cli('archive', self.src, self.tmp + '/a', '--password-file', pf)
+            self.assertEqual(rc, 2); self.assertIn('E_INPUT', err); self.assertNotIn('Traceback', err)
+    def test_dry_run_needs_no_password_and_writes_nothing(self):
+        rc, out, _ = self.run_cli('archive', self.src, self.tmp + '/a', '--dry-run', '--json')
+        self.assertEqual(rc, 0); j = json.loads(out); self.assertTrue(j['dry_run']); self.assertEqual(os.listdir(self.tmp), [])
+        rc, out, _ = self.run_cli('archive', self.src, self.tmp + '/a', '-p', PW, '--json')
+        self.assertEqual(json.loads(out)['archive_bytes'], j['archive_bytes'])
+    def test_errors_as_json(self):
+        rc, out, _ = self.run_cli('verify', self.tmp + '/none', '-p', PW, '--json')
+        self.assertEqual(rc, 2); self.assertEqual(json.loads(out)['error'], 'E_INPUT')
+    def test_wrong_password_exit_code_and_no_secret_in_output(self):
+        self.run_cli('archive', self.src, self.tmp + '/a', '-p', PW)
+        rc, out, err = self.run_cli('verify', self.tmp + '/a', '-p', 'wrong-password-123')
+        self.assertEqual(rc, 2); self.assertNotIn('wrong-password-123', out + err)
+    def test_explicit_strategy_overrides_profile(self):
+        self.run_cli('archive', self.src, self.tmp + '/a', '-p', PW, '--strategy', 'greedy')
+        rc, out, _ = self.run_cli('list', self.tmp + '/a', '-p', PW, '--json')
+        self.assertEqual({f['strategy'] for f in json.loads(out)['files']} - {'store'}, {'greedy'})
 
 class ListVerify(Base):
     def test_list_and_verify_multivolume(self):
@@ -52,7 +163,7 @@ class C1(Base):
     def test01_single_text(self): self.roundtrip({'a.txt': b'hello world, hello archive! ' * 40})
     def test02_empty_and_one_byte(self): self.roundtrip({'e.dat': b'', 'o.dat': b'x'})
     def test03_all_groups_corpus(self):
-        corp = ROOT + '/corpus'; files = {n: open(corp + '/' + n, 'rb').read() for n in os.listdir(corp) if n != 'labels.csv'}
+        corp = ROOT + '/corpus'; files = {n: rb(corp + '/' + n) for n in os.listdir(corp) if n != 'labels.csv'}
         _, st = self.roundtrip(files)
         self.assertEqual(st['orig_bytes'], 329903)
     def test04_identical_bytes_shrink_many_times(self):
@@ -60,13 +171,13 @@ class C1(Base):
     def test05_noise_no_compression(self):
         r = random.Random(1); noise = bytes(r.randrange(256) for _ in range(10000))
         src = mk({'n.bin': noise}); st = {}; archive.create(src, self.tmp + '/a', PW, stats=st)
-        fl, bl = fmt.parse_payload(fmt.open_volume(open(self.tmp + '/a.arc', 'rb').read(), PW)[1])
+        fl, bl = fmt.parse_payload(fmt.open_volume(rb(self.tmp + '/a.arc'), PW)[1])
         self.assertTrue(all(b['flag'] == 1 and b['coded'] == b['raw'] for b in bl))
         self.assertEqual(st['arc_bytes'] - len(noise), fmt.HDR + fmt.TAG + 6 + 2 + len('n.bin') + 10 + 15)   # measured overhead
     def test06_already_compressed_stored(self):
-        corp = ROOT + '/corpus'; d = open(corp + '/f0005.z', 'rb').read()
+        corp = ROOT + '/corpus'; d = rb(corp + '/f0005.z')
         src = mk({'f0005.z': d}); archive.create(src, self.tmp + '/a', PW)
-        fl, bl = fmt.parse_payload(fmt.open_volume(open(self.tmp + '/a.arc', 'rb').read(), PW)[1])
+        fl, bl = fmt.parse_payload(fmt.open_volume(rb(self.tmp + '/a.arc'), PW)[1])
         self.assertTrue(all(b['flag'] == 1 for b in bl))
     def test07_canonical_tree_from_lengths(self):
         lens = {65: 2, 66: 1, 67: 3, 68: 3}
@@ -76,7 +187,7 @@ class C1(Base):
     def test08_degenerate_alphabet(self):
         _, st = self.roundtrip({'s.dat': b'A' * 5000}); self.assertLess(st['arc_bytes'], 200)
     def test09_greedy_and_lazy_sizes(self):
-        d = open(ROOT + '/corpus/f0001.py', 'rb').read()[:16384]; sizes = {}
+        d = rb(ROOT + '/corpus/f0001.py')[:16384]; sizes = {}
         for s, n in [(codec.GREEDY, 'greedy'), (codec.LAZY, 'lazy'), (codec.DP, 'dp')]:
             toks = {codec.GREEDY: lz.parse_greedy, codec.LAZY: lz.parse_lazy}.get(s, lambda x: lz.parse_dp(x)[0])(d)
             self.assertEqual(lz.expand(toks), d); sizes[n] = len(huff.encode_tokens(toks))
@@ -87,7 +198,7 @@ class C1(Base):
             n = r.randint(1, 30); v = [r.randint(1, 999) for _ in range(n)]; w = [r.randint(1, 400) for _ in range(n)]; W = r.randint(50, 3000)
             self.assertGreaterEqual(knapsack.total(v, knapsack.knapsack_dp(v, w, W)), knapsack.total(v, knapsack.knapsack_greedy(v, w, W)))
     def test11_tamper_wrongpw_truncated(self):
-        src = mk({'a.txt': b'secret data ' * 100}); archive.create(src, self.tmp + '/a', PW); d = open(self.tmp + '/a.arc', 'rb').read()
+        src = mk({'a.txt': b'secret data ' * 100}); archive.create(src, self.tmp + '/a', PW); d = rb(self.tmp + '/a.arc')
         b = bytearray(d); b[50] ^= 1
         with self.assertRaises(SarcError) as c: fmt.open_volume(bytes(b), PW)
         self.assertEqual(c.exception.code, 'E_HMAC')
@@ -102,7 +213,7 @@ class C1(Base):
         self.assertGreater(len(outs), 1)
         sh = outs[::-1]; random.Random(1).shuffle(sh)
         names = archive.extract(sh, self.tmp + '/o', PW)                                  # any order
-        self.assertEqual(open(self.tmp + '/o/big.bin', 'rb').read(), big)
+        self.assertEqual(rb(self.tmp + '/o/big.bin'), big)
         with self.assertRaises(SarcError) as c: archive.extract(outs[1:], self.tmp + '/o2', PW)
         self.assertEqual(c.exception.code, 'E_VOLUME_MISSING')
         with self.assertRaises(SarcError) as c: archive.extract(outs + [outs[0]], self.tmp + '/o3', PW)
@@ -110,12 +221,12 @@ class C1(Base):
         self.assertFalse(os.path.exists(self.tmp + '/o2') and os.listdir(self.tmp + '/o2'))
         R = ROOT + '/reference'                                                           # teacher's reference archives
         for n in ['ref_01_single_file', 'ref_02_empty_file', 'ref_03_degenerate', 'ref_04_seven_groups', 'ref_05_no_compression', 'ref_06_two_volumes']:
-            j = json.load(open(f'{R}/{n}.json', encoding='utf-8')); d = archive.decode_archive(archive.find_volumes(f'{R}/{n}'), PW)
+            j = rj(f'{R}/{n}.json'); d = archive.decode_archive(archive.find_volumes(f'{R}/{n}'), PW)
             self.assertEqual({k: crc32(v) for k, v in d.items()}, {k: int(v['crc32'], 16) for k, v in j['вміст'].items()}, n)
 
 class Reference(unittest.TestCase):
     def test_bad_archives_expected_codes(self):
-        R = ROOT + '/reference'; exp = json.load(open(R + '/expected_failures.json', encoding='utf-8'))
+        R = ROOT + '/reference'; exp = rj(R + '/expected_failures.json')
         for n, v in exp.items():
             with self.assertRaises(SarcError, msg=n) as c: archive.decode_archive([f'{R}/{n}'], PW)
             self.assertEqual(c.exception.code, v['очікуваний_код'], n)
@@ -139,12 +250,12 @@ class C2_C5(Base):
         with self.assertRaises(SarcError) as c: archive.create(src, self.tmp + '/a', PW, archive.Config(max_volume=100))
         self.assertEqual(c.exception.code, 'E_CAPACITY')
     def test_volume_ten_times_smaller(self):
-        corp = ROOT + '/corpus'; files = {n: open(corp + '/' + n, 'rb').read() for n in ['f0000.txt', 'f0001.py', 'f0002.csv']}
+        corp = ROOT + '/corpus'; files = {n: rb(corp + '/' + n) for n in ['f0000.txt', 'f0001.py', 'f0002.csv']}
         outs, st = self.roundtrip(files, archive.Config(max_volume=6554, params=codec.Params(block_size=4096)))
         self.assertGreaterEqual(len(outs), 3)
         for o in outs: self.assertLessEqual(os.path.getsize(o), 6554)
     def test_volume_size_limit_respected_default(self):
-        corp = ROOT + '/corpus'; files = {n: open(corp + '/' + n, 'rb').read() for n in os.listdir(corp) if n != 'labels.csv'}
+        corp = ROOT + '/corpus'; files = {n: rb(corp + '/' + n) for n in os.listdir(corp) if n != 'labels.csv'}
         outs, _ = self.roundtrip(files); [self.assertLessEqual(os.path.getsize(o), 65536) for o in outs]
     def test_payload_unsafe_names_rejected(self):
         for bad in ['../x', '/abs', 'a\\b', 'c:x', '..', '.', 'a\0b', '']:
@@ -157,22 +268,22 @@ class C2_C5(Base):
             self.assertEqual(c.exception.code, 'E_PAYLOAD')
     def test_atomic_extraction_keeps_existing_files(self):
         src = mk({'a.txt': b'new content ' * 50}); archive.create(src, self.tmp + '/a', PW)
-        os.makedirs(self.tmp + '/o'); open(self.tmp + '/o/a.txt', 'wb').write(b'OLD')
+        os.makedirs(self.tmp + '/o'); wb(self.tmp + '/o/a.txt', b'OLD')
         with self.assertRaises(SarcError): archive.extract(self.tmp + '/a', self.tmp + '/o', 'wrongpw')
-        self.assertEqual(open(self.tmp + '/o/a.txt', 'rb').read(), b'OLD')
+        self.assertEqual(rb(self.tmp + '/o/a.txt'), b'OLD')
         self.assertEqual([x for x in os.listdir(self.tmp + '/o')], ['a.txt'])
     def test_header_public_only_salt_nonce(self):
-        src = mk({'secret_name.txt': b'x' * 500}); archive.create(src, self.tmp + '/a', PW); d = open(self.tmp + '/a.arc', 'rb').read()
+        src = mk({'secret_name.txt': b'x' * 500}); archive.create(src, self.tmp + '/a', PW); d = rb(self.tmp + '/a.arc')
         self.assertNotIn(b'secret_name', d); self.assertNotIn(PW.encode(), d)
     def test_fresh_salt_and_nonce_per_archive_distinct_per_volume(self):
         files = {'a.bin': bytes(random.Random(2).randrange(256) for _ in range(40000))}; src = mk(files)
         o1 = archive.create(src, self.tmp + '/a', PW, archive.Config(max_volume=16384))
         o2 = archive.create(src, self.tmp + '/b', PW, archive.Config(max_volume=16384))
-        h1 = [fmt.parse_header(open(p, 'rb').read()) for p in o1]; h2 = [fmt.parse_header(open(p, 'rb').read()) for p in o2]
+        h1 = [fmt.parse_header(rb(p)) for p in o1]; h2 = [fmt.parse_header(rb(p)) for p in o2]
         self.assertEqual(len({h['salt'] for h in h1}), 1); self.assertNotEqual(h1[0]['salt'], h2[0]['salt'])
         self.assertEqual(len({h['nonce'] for h in h1}), len(h1))
     def test_integrity_every_bit_flip_rejected(self):
-        src = mk({'a.txt': b'abc def ' * 200}); archive.create(src, self.tmp + '/a', PW); d = open(self.tmp + '/a.arc', 'rb').read()
+        src = mk({'a.txt': b'abc def ' * 200}); archive.create(src, self.tmp + '/a', PW); d = rb(self.tmp + '/a.arc')
         res = attack.integrity_attack(d, PW, lambda b, p: fmt.open_volume(b, p), n=120)
         self.assertFalse([r for r in res if r[1] == 'ACCEPTED'])
     def test_crc32_matches_zlib(self):
@@ -199,8 +310,8 @@ class Classifier(unittest.TestCase):
         if not os.path.exists(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'model.json')): self.skipTest('no model')
         C = classify.Classifier(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'model.json'))
         import csv
-        rows = list(csv.DictReader(open(ROOT + '/valid/labels.csv', encoding='utf-8')))
-        f1, _ = classify.macro_f1([int(r['type']) for r in rows], [C(open(ROOT + '/valid/' + r['file'], 'rb').read()) for r in rows])
+        rows = list(csv.DictReader(io.StringIO(rb(ROOT + '/valid/labels.csv').decode('utf-8'))))
+        f1, _ = classify.macro_f1([int(r['type']) for r in rows], [C(rb(ROOT + '/valid/' + r['file'])) for r in rows])
         self.assertGreaterEqual(f1, 0.61)
 
 class WeakCipherAttack(unittest.TestCase):
