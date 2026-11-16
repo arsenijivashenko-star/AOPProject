@@ -323,4 +323,89 @@ class WeakCipherAttack(unittest.TestCase):
         k, f, L = attack.crack_repeating_key(ct, model, attack.xor_dec, max_len=4, pop=40, gens=80)
         self.assertGreater(sum(a == b for a, b in zip(attack.xor_dec(ct, k), pt)) / len(pt), 0.95)
 
+class ParallelEncoding(Base):
+    """ROADMAP N1: --jobs N must not change a single coded byte."""
+    FILES = {'a.txt': b'alpha beta gamma delta ' * 3000, 'b.csv': b'1,2,3\n' * 6000, 'c.bin': bytes(random.Random(1).randrange(256) for _ in range(20000)), 'd.dat': b''}
+    def test_same_blocks_for_any_job_count(self):
+        src = mk(self.FILES); paths = archive.collect(src)
+        def run(j):
+            files, cands = archive.analyze_and_encode(paths, archive.Config(params=codec.Params(block_size=4096), jobs=j))
+            return files, [(c.file, c.idx, c.raw, c.flag, c.coded) for c in cands]
+        one = run(1); two = run(2)
+        self.assertEqual(one, two); self.assertGreater(len(one[1]), 8)
+    def test_parallel_archive_roundtrip(self):
+        self.roundtrip(self.FILES, archive.Config(params=codec.Params(block_size=4096), jobs=2))
+    def test_jobs_below_one_is_clamped(self):
+        self.assertEqual(archive.Config(jobs=0).jobs, 1); self.assertEqual(archive.Config(jobs=-3).jobs, 1)
+
+class IncludeExclude(Base):
+    """ROADMAP N4: glob filters for archive."""
+    def tree(self):
+        d = mk({'a.txt': b'a' * 100, 'b.tmp': b'b' * 100, 'c.py': b'c' * 100})
+        os.makedirs(d + '/.git'); wb(d + '/.git/config', b'x' * 50); os.makedirs(d + '/sub'); wb(d + '/sub/e.txt', b'e' * 60)
+        return d
+    def names(self, d, **kw): return [os.path.basename(p) for p in archive.collect(d, **kw)]
+    def test_exclude_glob_and_pruned_folder(self):
+        d = self.tree()
+        self.assertEqual(self.names(d, recursive=True, exclude=['*.tmp', '.git']), ['a.txt', 'c.py', 'e.txt'])
+    def test_include_and_exclude_wins(self):
+        d = self.tree()
+        self.assertEqual(self.names(d, recursive=True, include=['*.txt', '*.py'], exclude=['a.*']), ['c.py', 'e.txt'])
+    def test_relative_path_glob(self):
+        d = self.tree(); self.assertEqual(self.names(d, recursive=True, include=['sub/*']), ['e.txt'])
+    def test_filter_can_remove_duplicate_names(self):
+        d = self.tree(); os.makedirs(d + '/other'); wb(d + '/other/e.txt', b'z')
+        with self.assertRaises(SarcError): archive.collect(d, recursive=True)
+        self.assertEqual(self.names(d, recursive=True, exclude=['other']), ['config', 'a.txt', 'b.tmp', 'c.py', 'e.txt'])  # sorted by full path: .git/config first
+    def test_filter_everything_is_controlled_error(self):
+        d = self.tree()
+        with self.assertRaises(SarcError) as c: archive.create(d, self.tmp + '/a', PW, recursive=True, include=['*.nothing'])
+        self.assertEqual(c.exception.code, 'E_INPUT')
+    def test_archive_contains_only_selected(self):
+        d = self.tree(); archive.create(d, self.tmp + '/a', PW, recursive=True, exclude=['*.tmp', '.git'])
+        self.assertEqual([f['name'] for f in archive.list_archive(self.tmp + '/a', PW)[0]], ['a.txt', 'c.py', 'e.txt'])
+
+class DiffAndBench(Base):
+    """ROADMAP N3 (diff) and N2 (bench)."""
+    FILES = {'a.txt': b'hello diff ' * 500, 'b.csv': b'1;2;3\n' * 400}
+    def setUp(self):
+        super().setUp(); self.src = mk(self.FILES); archive.create(self.src, self.tmp + '/a', PW)
+    def test_identical_folder(self):
+        r = archive.diff_archive(self.tmp + '/a', self.src, PW)
+        self.assertEqual((r['same'], r['changed'], r['missing'], r['extra']), (['a.txt', 'b.csv'], [], [], []))
+    def test_changed_missing_extra(self):
+        b = bytearray(self.FILES['a.txt']); b[7] ^= 1; wb(self.src + '/a.txt', bytes(b)); os.remove(self.src + '/b.csv'); wb(self.src + '/new.txt', b'n')
+        r = archive.diff_archive(self.tmp + '/a', self.src, PW)
+        self.assertEqual((r['changed'], r['missing'], r['extra']), (['a.txt'], ['b.csv'], ['new.txt']))
+    def test_wrong_password_and_not_a_folder(self):
+        with self.assertRaises(SarcError) as c: archive.diff_archive(self.tmp + '/a', self.src, 'wrong')
+        self.assertEqual(c.exception.code, 'E_HMAC')
+        with self.assertRaises(SarcError) as c: archive.diff_archive(self.tmp + '/a', self.src + '/a.txt', PW)
+        self.assertEqual(c.exception.code, 'E_INPUT')
+    def test_cli_exit_codes(self):
+        import contextlib, sarc_cli
+        def run(*argv):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out): rc = sarc_cli.main(list(argv))
+            return rc, out.getvalue()
+        rc, out = run('diff', self.tmp + '/a', self.src, '-p', PW, '--json'); self.assertEqual(rc, 0); self.assertTrue(json.loads(out)['identical'])
+        wb(self.src + '/a.txt', b'changed'); rc, out = run('diff', self.tmp + '/a', self.src, '-p', PW)
+        self.assertEqual(rc, 1); self.assertIn('~ a.txt', out)
+    def test_bench_reports_q_and_roundtrip(self):
+        import contextlib, sarc_cli
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out): rc = sarc_cli.main(['bench', self.src, '--profiles', 'fast', 'balanced', '--json'])
+        j = json.loads(out.getvalue()); self.assertEqual(rc, 0); self.assertEqual([r['profile'] for r in j['results']], ['fast', 'balanced'])
+        for r in j['results']:
+            self.assertTrue(r['roundtrip_ok']); self.assertTrue(0 < r['Q'] < 1); self.assertAlmostEqual(r['Q'], 0.7 * r['S'] + 0.3 * r['T'], places=3)
+
+class VolumeEdgeCases(Base):
+    """ROADMAP #5: limits give controlled errors, never a traceback."""
+    def test_volume_too_small_for_header(self):
+        src = mk({'a.txt': b'x' * 100})
+        with self.assertRaises(SarcError) as c: archive.create(src, self.tmp + '/a', PW, archive.Config(max_volume=41 + 32 + 6))
+        self.assertEqual(c.exception.code, 'E_CAPACITY')
+    def test_name_of_255_bytes_and_zero_size_roundtrip(self):
+        self.roundtrip({'n' * 255: b'', 'z.txt': b'zero neighbour ' * 50})
+
 if __name__ == '__main__': unittest.main()

@@ -1,5 +1,6 @@
 """SARC archiver: create (analysis -> parse -> huffman -> knapsack packing -> AES-CTR + HMAC) and extract (atomic)."""
-import os, struct, time, secrets, tempfile, shutil, logging, glob, hmac, hashlib
+import os, struct, time, secrets, tempfile, shutil, logging, glob, hmac, hashlib, fnmatch
+from concurrent.futures import ProcessPoolExecutor
 from fmt import *
 from codec import *
 import knapsack
@@ -9,9 +10,10 @@ TYPE_PRIORITY = {0: 3, 1: 3, 2: 2, 3: 2, 4: 2, 5: 1, 6: 1}      # team_config.js
 MAX_NAME_BYTES = 255
 
 class Config:
-    def __init__(self, max_volume=65536, params=None, packer='dp', classifier=None, strategy_by_type=None, progress=None):
+    def __init__(self, max_volume=65536, params=None, packer='dp', classifier=None, strategy_by_type=None, progress=None, jobs=1):
         self.max_volume = max_volume; self.params = params or Params(); self.packer = packer
         self.classifier = classifier
+        self.jobs = max(1, int(jobs or 1))      # worker processes for block encoding; the archive is byte-identical for any value
         self.progress = progress        # optional callable(done_bytes, total_bytes), called after every encoded block
         # per-type strategy chosen by the analysis block; type 5 (already compressed) -> store
         self.strategy_by_type = strategy_by_type or {5: STORE}
@@ -37,14 +39,25 @@ def _validate_input(path):
     if len(nb) > MAX_NAME_BYTES: raise SarcError('E_INPUT', 'file name too long')
     if not safe_name(name): raise SarcError('E_INPUT', f'unsafe file name: {name!r}')
 
-def collect(input_path, recursive=False):
+def _selected(rel, include, exclude):
+    """Glob filter on the file name AND the relative path (so both '*.tmp' and 'build/*' work). exclude wins over include."""
+    base = os.path.basename(rel); rel = rel.replace(os.sep, '/')
+    hit = lambda pats: any(fnmatch.fnmatchcase(base, p) or fnmatch.fnmatchcase(rel, p) for p in pats)
+    if exclude and hit(exclude): return False
+    return not include or hit(include)
+
+def collect(input_path, recursive=False, include=None, exclude=None):
     if os.path.isfile(input_path): return [input_path]
     if not os.path.isdir(input_path): raise SarcError('E_INPUT', 'input does not exist')
     out = []
     if recursive:
-        for r, _, fs in os.walk(input_path): out += [os.path.join(r, f) for f in fs]
+        for r, ds, fs in os.walk(input_path):
+            ds[:] = sorted(d for d in ds if not (exclude and any(fnmatch.fnmatchcase(d, p) for p in exclude)))   # prune excluded folders
+            out += [os.path.join(r, f) for f in fs]
     else:
         out = [os.path.join(input_path, f) for f in os.listdir(input_path) if os.path.isfile(os.path.join(input_path, f))]
+    if include or exclude:
+        out = [p for p in out if _selected(os.path.relpath(p, input_path), include, exclude)]
     out.sort()
     names = [os.path.basename(p) for p in out]
     dup = {n for n in names if names.count(n) > 1}
@@ -54,31 +67,50 @@ def collect(input_path, recursive=False):
 class Cand:     # candidate block
     __slots__ = ('file', 'idx', 'raw', 'flag', 'coded', 'value')
 
+def _enc(job):
+    raw, p = job
+    return encode_block(raw, p)
+
 def analyze_and_encode(paths, cfg, stats=None):
-    """Returns (files, cands). files: list of dict(name,size,crc,type,strat). Blocks are encoded BEFORE packing."""
+    """Returns (files, cands). files: list of dict(name,size,crc,type,strat). Blocks are encoded BEFORE packing.
+    cfg.jobs > 1 encodes blocks in worker processes. Blocks are independent and results are consumed in submission order,
+    so the output is byte-identical to the sequential run (determinism is covered by a test)."""
     files = []; cands = []; bs = cfg.params.block_size
     total_bytes = sum(os.path.getsize(p) for p in paths if os.path.isfile(p)); done = 0
-    for fi, path in enumerate(paths):
-        _validate_input(path)
-        size = os.path.getsize(path)
-        with open(path, 'rb') as f:
-            head = f.read(min(size, 65536))                     # analysis sample (bounded memory)
-            ftype = cfg.classifier(head) if cfg.classifier else 6
-            strat = cfg.strategy_by_type.get(ftype, cfg.params.strategy)
-            p = cfg.params.copy(strategy=strat)
-            f.seek(0); crc = 0; bi = 0; total = 0
-            while True:
-                raw = f.read(bs)
-                if not raw and bi > 0: break
-                crc = crc32(raw, crc); total += len(raw); done += len(raw)
-                flag, coded = encode_block(raw, p)
-                if cfg.progress: cfg.progress(done, total_bytes)
-                c = Cand(); c.file = fi; c.idx = bi; c.raw = len(raw); c.flag = flag; c.coded = coded
-                c.value = TYPE_PRIORITY.get(ftype, 1) * (len(raw) + 1)
-                cands.append(c); bi += 1
-                if not raw: break
-        files.append(dict(name=os.path.basename(path), size=total, crc=crc, type=ftype, strat=strat))
-        if stats is not None: stats.setdefault('per_file', []).append((os.path.basename(path), ftype, total))
+    batch = []; limit = 1 if cfg.jobs <= 1 else cfg.jobs * 4        # bounded memory: at most `limit` raw blocks in flight
+    pool = ProcessPoolExecutor(max_workers=cfg.jobs) if cfg.jobs > 1 else None
+    def flush():
+        nonlocal done
+        if not batch: return
+        jobs = [(raw, p) for _, _, raw, p, _ in batch]
+        res = list(pool.map(_enc, jobs)) if pool else [_enc(j) for j in jobs]
+        for (fi, bi, raw, _, ftype), (flag, coded) in zip(batch, res):
+            c = Cand(); c.file = fi; c.idx = bi; c.raw = len(raw); c.flag = flag; c.coded = coded
+            c.value = TYPE_PRIORITY.get(ftype, 1) * (len(raw) + 1); cands.append(c); done += len(raw)
+        batch.clear()
+        if cfg.progress: cfg.progress(done, total_bytes)
+    try:
+        for fi, path in enumerate(paths):
+            _validate_input(path)
+            size = os.path.getsize(path)
+            with open(path, 'rb') as f:
+                head = f.read(min(size, 65536))                     # analysis sample (bounded memory)
+                ftype = cfg.classifier(head) if cfg.classifier else 6
+                strat = cfg.strategy_by_type.get(ftype, cfg.params.strategy)
+                p = cfg.params.copy(strategy=strat)
+                f.seek(0); crc = 0; bi = 0; total = 0
+                while True:
+                    raw = f.read(bs)
+                    if not raw and bi > 0: break
+                    crc = crc32(raw, crc); total += len(raw)
+                    batch.append((fi, bi, raw, p, ftype)); bi += 1
+                    if len(batch) >= limit: flush()
+                    if not raw: break
+            files.append(dict(name=os.path.basename(path), size=total, crc=crc, type=ftype, strat=strat))
+            if stats is not None: stats.setdefault('per_file', []).append((os.path.basename(path), ftype, total))
+        flush()
+    finally:
+        if pool: pool.shutdown(wait=True, cancel_futures=True)
     return files, cands
 
 def _table_bytes(f): return 2 + len(f['name'].encode('utf-8')) + 10
@@ -122,11 +154,11 @@ def seal_volume(payload, ke, km, salt, nonce_prefix, idx, total):
     assert len(head) == HDR
     return head + ct + hmac.new(km, head + ct, hashlib.sha256).digest()
 
-def dry_run(input_path, cfg=None, recursive=False):
+def dry_run(input_path, cfg=None, recursive=False, include=None, exclude=None):
     """Plan an archive WITHOUT writing anything: encodes all blocks (weights must be exact), solves the knapsack for every
     volume and returns the exact size the archive would have. No password / key derivation is needed."""
     cfg = cfg or Config(); t0 = time.time()
-    paths = collect(input_path, recursive)
+    paths = collect(input_path, recursive, include, exclude)
     if not paths: raise SarcError('E_INPUT', 'no input files')
     if len(paths) > 65535: raise SarcError('E_INPUT', 'too many files')
     st = {}
@@ -138,12 +170,12 @@ def dry_run(input_path, cfg=None, recursive=False):
     return dict(files=files, volumes=len(plan), vol_info=info, volume_bytes=vols, arc_bytes=sum(vols), orig_bytes=orig,
                 blocks=len(cands), max_volume=cfg.max_volume, seconds=time.time() - t0)
 
-def create(input_path, out_base, password, cfg=None, recursive=False, stats=None):
+def create(input_path, out_base, password, cfg=None, recursive=False, stats=None, include=None, exclude=None):
     """Returns list of written volume paths. Raises SarcError."""
     cfg = cfg or Config()
     if not password: raise SarcError('E_INPUT', 'empty password')
     t0 = time.time()
-    paths = collect(input_path, recursive)
+    paths = collect(input_path, recursive, include, exclude)
     if not paths: raise SarcError('E_INPUT', 'no input files')
     if len(paths) > 65535: raise SarcError('E_INPUT', 'too many files')
     files, cands = analyze_and_encode(paths, cfg, stats)
@@ -260,3 +292,23 @@ def list_archive(arg, password):
 def verify(arg, password):
     """Full integrity check (HMAC, structure, decompression, size, CRC32 of every file) with nothing written to disk."""
     return len(decode_archive(find_volumes(arg), password))
+
+def diff_archive(arg, directory, password, recursive=False):
+    """Compare archive contents with a folder WITHOUT extracting to disk (ROADMAP N3). Returns
+    dict(same=[...], changed=[...], missing=[...], extra=[...]): 'missing' = in the archive but not in the folder,
+    'extra' = in the folder but not in the archive. The archive is fully authenticated and CRC-checked first."""
+    if not os.path.isdir(directory): raise SarcError('E_INPUT', 'not a folder')
+    data = decode_archive(find_volumes(arg), password)
+    present = {}
+    if recursive:
+        for r, _, fs in os.walk(directory):
+            for f in fs: present.setdefault(f, os.path.join(r, f))
+    else:
+        for f in os.listdir(directory):
+            if os.path.isfile(os.path.join(directory, f)): present[f] = os.path.join(directory, f)
+    out = dict(same=[], changed=[], missing=[], extra=sorted(set(present) - set(data)))
+    for n in sorted(data):
+        if n not in present: out['missing'].append(n); continue
+        with open(present[n], 'rb') as fh: cur = fh.read()
+        out['same' if cur == data[n] else 'changed'].append(n)
+    return out

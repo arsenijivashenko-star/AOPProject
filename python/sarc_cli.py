@@ -5,6 +5,9 @@
   sarc_cli.py extract ARCHIVE OUTDIR -p PASSWORD [--only NAME ...]   (ARCHIVE: base name, a .arc file, or several volume files)
   password: -p PASSWORD | --password-file FILE ('-' = stdin) | $SARC_PASSWORD | interactive prompt
   --json prints one machine-readable JSON object to stdout (errors too); --progress writes a progress bar to stderr
+  archive also takes: --include GLOB ... --exclude GLOB ... (filter files; exclude wins), --jobs N (parallel block encoding; same bytes for any N)
+  sarc_cli.py diff ARCHIVE DIR -p PASSWORD              (archive vs folder: same / changed / missing / extra; exit 1 if they differ)
+  sarc_cli.py bench DIR [--profiles fast balanced best] (size, time and Q = 0.7*S + 0.3*T per profile; verifies the round trip)
   sarc_cli.py list ARCHIVE -p PASSWORD                  (file table: names, sizes, CRC32, type, strategy, volumes)
   sarc_cli.py verify ARCHIVE -p PASSWORD                (full integrity check, writes nothing)
   sarc_cli.py info VOLUME.arc                           (public header only; nothing is decrypted)
@@ -57,9 +60,9 @@ def cmd_archive(a):
     else:
         by_type = archive.profile_strategies(a.profile); params = codec.Params(strategy=codec.LAZY, block_size=a.block_size)
     cfg = archive.Config(max_volume=a.max_volume, params=params, packer=a.packer, classifier=clf,
-                         strategy_by_type=by_type, progress=_progress(a))
+                         strategy_by_type=by_type, progress=_progress(a), jobs=a.jobs)
     if a.dry_run:
-        st = archive.dry_run(a.input, cfg, a.recursive)
+        st = archive.dry_run(a.input, cfg, a.recursive, a.include, a.exclude)
         ratio = st['orig_bytes'] / max(1, st['arc_bytes'])
         _emit(a, dict(dry_run=True, files=len(st['files']), orig_bytes=st['orig_bytes'], archive_bytes=st['arc_bytes'], ratio=round(ratio, 4),
                       volumes=st['volumes'], volume_bytes=st['volume_bytes'], blocks=st['blocks'], seconds=round(st['seconds'], 3),
@@ -72,7 +75,7 @@ def cmd_archive(a):
                 print(f"  volume {i}: W={v['W']} B (file table {v['table']} B), {v['n']} block(s), knapsack weight {v['weight']}, value {v['value']}, size {st['volume_bytes'][i]} B")
         return 0
     st = {}
-    outs = archive.create(a.input, a.output, _pw(a), cfg, a.recursive, st)
+    outs = archive.create(a.input, a.output, _pw(a), cfg, a.recursive, st, a.include, a.exclude)
     ratio = st['orig_bytes'] / max(1, st['arc_bytes'])
     if a.json:
         _emit(a, dict(outputs=outs, files=len(st['files']), orig_bytes=st['orig_bytes'], archive_bytes=st['arc_bytes'],
@@ -104,9 +107,52 @@ def cmd_verify(a):
     n = archive.verify(arc, _pw(a))
     _emit(a, dict(ok=True, files_verified=n), f'OK: {n} file(s) verified (HMAC, structure, CRC32); nothing written'); return 0
 
+def cmd_diff(a):
+    arc = a.archive if len(a.archive) > 1 else a.archive[0]
+    r = archive.diff_archive(arc, a.dir, _pw(a), a.recursive)
+    same = not (r['changed'] or r['missing'] or r['extra'])
+    if a.json: _emit(a, dict(identical=same, **r)); return 0 if same else 1
+    for k, sym in (('changed', '~'), ('missing', '-'), ('extra', '+')):
+        for n in r[k]: print(f'{sym} {n}  ({k})')
+    print(f"{len(r['same'])} same, {len(r['changed'])} changed, {len(r['missing'])} missing in folder, {len(r['extra'])} not in archive")
+    return 0 if same else 1
+
+def _tref(a):
+    for cand in (a.config, os.path.join(a.dir, 'team_config.json'), os.path.join(HERE, '..', 'team_config.json')):
+        if cand and os.path.isfile(cand):
+            try:
+                with open(cand, encoding='utf-8') as f: return float(json.load(f)['метрика_Q']['t_ref_секунд'])
+            except (OSError, KeyError, ValueError, TypeError): pass
+    return 30.0
+
+def cmd_bench(a):
+    """Real archive -> verify -> compare cycle per profile, then Q = alpha*S + beta*T (S = B/(B+arc), T = t_ref/(t_ref+t))."""
+    import tempfile, shutil, time
+    clf = None
+    if os.path.isfile(MODEL) and not a.no_classifier:
+        import classify; clf = classify.Classifier(MODEL)
+    tref = _tref(a); rows = []
+    tmp = tempfile.mkdtemp(prefix='sarc_bench_')
+    try:
+        for name in a.profiles:
+            cfg = archive.Config(max_volume=a.max_volume, params=codec.Params(strategy=codec.LAZY, block_size=a.block_size), classifier=clf,
+                                 strategy_by_type=archive.profile_strategies(name), jobs=a.jobs)
+            st = {}; base = os.path.join(tmp, name)
+            archive.create(a.dir, base, 'bench-password', cfg, a.recursive, st, a.include, a.exclude)
+            ok = not any(archive.diff_archive(base, a.dir, 'bench-password', a.recursive)[k] for k in ('changed', 'missing'))
+            orig, arc, t = st['orig_bytes'], st['arc_bytes'], st['seconds']
+            S = orig / (orig + arc); T = tref / (tref + t); Q = (0.7 * S + 0.3 * T) if ok else 0.0
+            rows.append(dict(profile=name, archive_bytes=arc, ratio=round(orig / max(1, arc), 4), seconds=round(t, 3), S=round(S, 4), T=round(T, 4), Q=round(Q, 4),
+                             volumes=st['volumes'], roundtrip_ok=ok))
+    finally: shutil.rmtree(tmp, ignore_errors=True)
+    if a.json: _emit(a, dict(t_ref=tref, results=rows)); return 0 if all(r['roundtrip_ok'] for r in rows) else 1
+    print(f'profile   archive B  ratio  time s       S       T       Q  vols  ok   (t_ref={tref:g} s)')
+    for r in rows: print(f"{r['profile']:<9} {r['archive_bytes']:>9} {r['ratio']:>6.3f} {r['seconds']:>7.2f} {r['S']:>7.4f} {r['T']:>7.4f} {r['Q']:>7.4f} {r['volumes']:>5}  {'yes' if r['roundtrip_ok'] else 'NO'}")
+    return 0 if all(r['roundtrip_ok'] for r in rows) else 1
+
 def cmd_info(a):
     for p in a.volumes:
-        d = open(p, 'rb').read()
+        with open(p, 'rb') as fh: d = fh.read()
         try: h = parse_header(d)
         except SarcError as e: print(f'{p}: INVALID ({e.code})'); continue
         print(f"{p}: SARC v1 volume {h['idx']}/{h['tot']} ciphertext={h['n']}B total={len(d)}B salt={h['salt'].hex()} (public)")
@@ -148,10 +194,19 @@ def main(argv=None):
     p.add_argument('--profile', choices=sorted(archive.PROFILES), default='balanced', help='fast = lazy; balanced = dp-iter on text/code/data, dp on raster/exe (default); best = dp-iter everywhere')
     p.add_argument('--packer', choices=['dp', 'greedy'], default='dp'); p.add_argument('--recursive', action='store_true')
     p.add_argument('--no-classifier', action='store_true', help='skip file-type detection (every file is treated as type 6)')
+    p.add_argument('--include', nargs='+', metavar='GLOB', help='archive only files whose name or relative path matches a glob')
+    p.add_argument('--exclude', nargs='+', metavar='GLOB', help='skip matching files (and folders with --recursive); wins over --include')
+    p.add_argument('--jobs', type=int, default=1, metavar='N', help='worker processes for block encoding (default 1; the archive is identical for any N)')
     p.add_argument('--dry-run', action='store_true', help='plan volumes and predict the exact archive size; writes nothing, no password needed')
     common(p); p.set_defaults(f=cmd_archive)
     p = sp.add_parser('extract'); p.add_argument('archive', nargs='+'); p.add_argument('outdir'); common(p)
     p.add_argument('--only', nargs='+', metavar='NAME', help='extract just these files (the rest are authenticated, not decoded)'); p.set_defaults(f=cmd_extract)
+    p = sp.add_parser('diff'); p.add_argument('archive', nargs='+'); p.add_argument('dir'); p.add_argument('--recursive', action='store_true'); common(p); p.set_defaults(f=cmd_diff)
+    p = sp.add_parser('bench'); p.add_argument('dir'); p.add_argument('--profiles', nargs='+', choices=sorted(archive.PROFILES), default=['fast', 'balanced', 'best'])
+    p.add_argument('--max-volume', type=int, default=65536); p.add_argument('--block-size', type=int, default=16384); p.add_argument('--recursive', action='store_true')
+    p.add_argument('--include', nargs='+', metavar='GLOB'); p.add_argument('--exclude', nargs='+', metavar='GLOB'); p.add_argument('--jobs', type=int, default=1)
+    p.add_argument('--config', help='team_config.json with t_ref (default: found next to DIR or the project root, else 30 s)'); p.add_argument('--no-classifier', action='store_true')
+    p.add_argument('--json', action='store_true'); p.set_defaults(f=cmd_bench)
     p = sp.add_parser('list'); p.add_argument('archive', nargs='+'); common(p); p.set_defaults(f=cmd_list)
     p = sp.add_parser('verify'); p.add_argument('archive', nargs='+'); common(p); p.set_defaults(f=cmd_verify)
     p = sp.add_parser('info'); p.add_argument('volumes', nargs='+'); p.set_defaults(f=cmd_info)
