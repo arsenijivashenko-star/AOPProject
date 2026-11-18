@@ -2,7 +2,7 @@
 
 | folder | content |
 |---|---|
-| `python/` | tested reference implementation (47 tests pass; `dp-iter` parser, `list`/`verify` commands), GA, attacks, report generator — see `python/README.md` |
+| `python/` | tested reference implementation (64 tests pass; `dp-iter` parser, `list`/`verify` commands), GA, attacks, report generator — see `python/README.md` |
 | `csharp/` | .NET 9 port of the core (NOT compiled yet — run `selftest` first) — see `csharp/README.md` |
 | `corpus/ train/ valid/ reference/ team_config.json` | teacher-issued data and reference archives |
 

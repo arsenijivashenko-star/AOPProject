@@ -21,6 +21,7 @@ SARC_PROJECT=/path/to/Project python3 -m unittest -v tests/test_sarc.py
 Common options of archive/extract/list/verify: `--json` (one JSON object on stdout, errors too), `--progress` (bar on stderr), `--password-file FILE`.
 Password order: `-p` > `--password-file` > `$SARC_PASSWORD` > prompt. Exit codes: 0 ok, 2 SARC error, 3 I/O or memory, 130 Ctrl+C.
 Default profile is `balanced` (see REPORT_TABLES.md §8); `--no-classifier` makes every file type 6, i.e. `lazy`.
+Selective extraction authenticates and parses the complete volume set, but decompresses and writes only the names passed to `--only`. A missing requested name is reported as `E_INPUT`.
 Errors: E_MAGIC E_VERSION E_LENGTH E_HMAC E_PAYLOAD E_CRC E_VOLUME_MISSING E_VOLUME_DUP E_CAPACITY E_INPUT.
 See REPORT_TABLES.md for measured results and NOTES below.
 

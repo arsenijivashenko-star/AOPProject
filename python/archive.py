@@ -208,11 +208,15 @@ def find_volumes(arg):
     if os.path.isfile(arg + '.arc'): return [arg + '.arc']
     raise SarcError('E_INPUT', 'archive not found')
 
-def decode_archive(vol_paths, password, only=None):
+def decode_archive(vol_paths, password, only=None, only_names=None):
     """Returns {name: bytes}; verifies every volume (header -> HMAC -> payload -> CRC32). Nothing is written.
     only: optional collection of file names. Every volume is still authenticated (HMAC) and the whole file table is
-    checked, but block data is decoded (and CRC32-checked) just for the requested files."""
+    checked, but block data is decoded (and CRC32-checked) just for the requested files. Blocks of other files are not
+    even collected. `only_names` is an alias of `only`. An empty selection or an unknown name is E_INPUT."""
     if not vol_paths: raise SarcError('E_INPUT', 'no volumes')
+    if only is None: only = only_names
+    selected = None if only is None else set(only)
+    if selected is not None and not selected: raise SarcError('E_INPUT', 'no files selected')
     cache = {}; seen = {}; tot = None; metas = {}; blocks = {}
     for p in vol_paths:
         with open(p, 'rb') as f: d = f.read()
@@ -226,17 +230,18 @@ def decode_archive(vol_paths, password, only=None):
             f = fl[b['fi']]
             m = metas.setdefault(f['name'], dict(size=f['size'], crc=f['crc'], type=f['type']))
             if (m['size'], m['crc']) != (f['size'], f['crc']): raise SarcError('E_PAYLOAD', 'inconsistent file table')
-            if b['off'] in blocks.setdefault(f['name'], {}): raise SarcError('E_PAYLOAD', 'duplicate block')
-            blocks[f['name']][b['off']] = b
+            if selected is None or f['name'] in selected:
+                if b['off'] in blocks.setdefault(f['name'], {}): raise SarcError('E_PAYLOAD', 'duplicate block')
+                blocks[f['name']][b['off']] = b
         for f in fl: metas.setdefault(f['name'], dict(size=f['size'], crc=f['crc'], type=f['type']))
     missing = [i for i in range(tot) if i not in seen]
     if missing: raise SarcError('E_VOLUME_MISSING', f'missing volume(s) {missing}')
+    if selected is not None:
+        absent = sorted(selected - set(metas))
+        if absent: raise SarcError('E_INPUT', f'file(s) not found in archive: {absent}')
     out = {}
-    if only is not None:
-        only = list(dict.fromkeys(only)); unknown = [n for n in only if n not in metas]
-        if unknown: raise SarcError('E_INPUT', f'not in archive: {unknown[:3]}')
     for name, m in metas.items():
-        if only is not None and name not in only: continue
+        if selected is not None and name not in selected: continue
         bl = blocks.get(name, {}); idxs = sorted(bl)
         if idxs != list(range(len(idxs))): raise SarcError('E_PAYLOAD', 'block gap')
         buf = bytearray()
@@ -253,11 +258,11 @@ def decode_archive(vol_paths, password, only=None):
         out[name] = bytes(buf)
     return out
 
-def extract(archive, outdir, password, only=None):
+def extract(archive, outdir, password, only=None, only_names=None):
     """Atomic: decode+verify everything first, write into a temp dir inside outdir, then move into place.
     only: optional list of file names to extract (the others are authenticated but not decoded)."""
     vols = find_volumes(archive)
-    data = decode_archive(vols, password, only)
+    data = decode_archive(vols, password, only, only_names)
     os.makedirs(outdir, exist_ok=True)
     tmp = tempfile.mkdtemp(prefix='.sarc_', dir=outdir)
     try:
